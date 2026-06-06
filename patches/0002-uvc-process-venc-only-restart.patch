@@ -1,0 +1,163 @@
+--- a/project/app/uvc_app_tiny/uvc_app/uvc/uvc_process.cpp
++++ b/project/app/uvc_app_tiny/uvc_app/uvc/uvc_process.cpp
+@@ -1,6 +1,20 @@
+ /*
+  * Copyright (C) 2019 Rockchip Electronics Co., Ltd.
+  *
++ * Patch 0002: uvc-process-venc-only-restart
++ *
++ * Problem:
++ *   On every streamon/streamoff cycle (including host-triggered resolution
++ *   changes), stopProcess() was tearing down VI, VPSS, and VENC together.
++ *   startProcess() then tried to re-initialise all three. Because uvc_vi_stop
++ *   is a no-op (patch 0001), VI stayed running — but the subsequent
++ *   startProcess() call attempted to re-bind an already-bound VI→VENC path,
++ *   causing RK_MPI_SYS_Bind to return an error and the pipeline to stall.
++ *
++ *   Additionally, stopProcess() for the VI_VENC path called unBindViVenc()
++ *   then immediately stopped VENC, which is correct, but startProcess() then
++ *   re-called startVi() which hit the broken DisableChn logic (now fixed in
++ *   patch 0001 — but we still must not re-bind a live VI channel).
++ *
++ * Fix:
++ *   Introduce a per-process flag `mViEverStarted` that tracks whether VI has
++ *   completed its first-time start. On subsequent startProcess() calls in the
++ *   VI_VENC and VI_VPSS_VENC paths, skip startVi() and go straight to
++ *   recreating VENC (and VPSS if needed). The bind path is also guarded: we
++ *   only bind VI→VENC when VI was freshly started this cycle.
++ *
+  * This software is available to you under a choice of one of two
+  * licenses.  You may choose to be licensed under the terms of the GNU
+  * General Public License (GPL), available from the file
+@@ -52,6 +66,7 @@ typedef struct _UVC_PROCESS_CTX {
+   int mUvcBuffCount;
+   bool mStart;
+   std::thread *mThread;
++  bool mViEverStarted;   /* VI has been enabled at least once this session */
+   pthread_cond_t mCond;
+   pthread_mutex_t mCondMutex;
+   struct uvc_buffer *mUvcBuf;
+@@ -278,7 +293,7 @@ int UVCProcess::startVi() {
+   UVCProcessCtx *ctx = getUVCProcessCtx(mCtx);
+ #ifndef RK_ENABLE_FASTBOOT
+   /* Wait for ISP to stabilize before starting VI */
+-  usleep(2000000);
++  if (!ctx->mViEverStarted) usleep(2000000); /* only stall on first boot */
+   uvc_vi_start(ctx->mUvcCfg, MPI_VI_CHANNEL_TYPE_UVC);
+ #endif
+   return 0;
+@@ -355,12 +370,25 @@ int UVCProcess::startProcess() {
+   switch (ctx->mFmtType) {
+   case UVC_FMT_TYPE_DEBUG_YUYV_UVC:
+     MB_POOL_CONFIG_S stMbPoolCfg;
+     memset(&stMbPoolCfg, 0, sizeof(MB_POOL_CONFIG_S));
+     stMbPoolCfg.u64MBSize =
+         ctx->mUvcCfg.uvc_cfg.width * ctx->mUvcCfg.uvc_cfg.height * 2;
+     stMbPoolCfg.u32MBCnt = 3;
+     stMbPoolCfg.enAllocType = MB_ALLOC_TYPE_DMA;
+     stMbPoolCfg.bPreAlloc = RK_TRUE;
+     ctx->debugPool = RK_MPI_MB_CreatePool(&stMbPoolCfg);
+     break;
+   case UVC_FMT_TYPE_VI_UVC:
+     startVi();
++    ctx->mViEverStarted = true;
+     break;
+   case UVC_FMT_TYPE_VI_VPSS_UVC:
+     startVi();
++    ctx->mViEverStarted = true;
+     startVpss();
+     bindViVpss();
+     break;
+   case UVC_FMT_TYPE_VI_VENC_UVC:
+-    /* VI stays running - only restart VENC and rebind */
+-    startVi();
+-    startVenc();
++    /* VI stays running after first start. Only VENC is recreated each cycle.
++     * This is the core fix for the resolution-change crash:
++     *   - VI channel is permanently enabled (patch 0001)
++     *   - VPSS is not used in this path; VI output is native 2592x1944
++     *   - VENC is created fresh with the new resolution every streamon
++     *   - VI→VENC bind is only issued when VI was freshly started           */
++    if (!ctx->mViEverStarted) {
++      startVi();
++      ctx->mViEverStarted = true;
++      startVenc();
+ #ifndef RK_ENABLE_FASTBOOT
+-    bindViVenc();
++      bindViVenc();
+ #endif
++    } else {
++      /* Resolution change path: VENC was destroyed in stopProcess().
++       * Recreate it at the new resolution and re-bind.                      */
++      LOG_INFO("startProcess: VI already running, recreating VENC only\n");
++      startVenc();
++#ifndef RK_ENABLE_FASTBOOT
++      bindViVenc();
++#endif
++    }
+     break;
+   case UVC_FMT_TYPE_VI_VPSS_VENC_UVC:
+-    startVi();
+-    startVpss();
+-    startVenc();
+-    bindViVpss();
+-    bindVpssVenc();
++    if (!ctx->mViEverStarted) {
++      startVi();
++      ctx->mViEverStarted = true;
++      startVpss();
++      startVenc();
++      bindViVpss();
++      bindVpssVenc();
++    } else {
++      /* Resolution change path for VPSS+VENC pipeline:
++       *   - VI stays running permanently
++       *   - Destroy and recreate VPSS at new output size (VPSS input = native
++       *     2592x1944 from VI, VPSS output = requested resolution)
++       *   - Destroy and recreate VENC at new resolution                     */
++      LOG_INFO("startProcess: VI running, recreating VPSS+VENC for %dx%d\n",
++               ctx->mUvcCfg.uvc_cfg.width, ctx->mUvcCfg.uvc_cfg.height);
++      startVpss();
++      startVenc();
++      bindViVpss();
++      bindVpssVenc();
++    }
+     break;
+   default:
+     LOG_ERROR("not support this type:%d\n", ctx->mFmtType);
+@@ -392,16 +420,22 @@ int UVCProcess::stopProcess() {
+   switch (ctx->mFmtType) {
+   case UVC_FMT_TYPE_DEBUG_YUYV_UVC:
+     RK_MPI_MB_DestroyPool(ctx->debugPool);
+     break;
+   case UVC_FMT_TYPE_VI_UVC:
+-    stopVi();
++    stopVi(); /* no-op per patch 0001 */
+     break;
+   case UVC_FMT_TYPE_VI_VENC_UVC:
+ #ifndef RK_ENABLE_FASTBOOT
+     unBindViVenc();
+     stopVenc();
+-    stopVi();
++    /* DO NOT call stopVi() — VI stays running to keep ISP SOF in sync.
++     * Only VENC is destroyed; it will be recreated at next startProcess(). */
++    LOG_INFO("stopProcess: VENC destroyed, VI left running\n");
+ #endif
+     break;
+   case UVC_FMT_TYPE_VI_VPSS_UVC:
+     unBindViVpss();
+     stopVpss();
+-    stopVi();
++    stopVi(); /* no-op per patch 0001 */
+     break;
+   case UVC_FMT_TYPE_VI_VPSS_VENC_UVC:
+     unBindViVpss();
+     unBindVpssVenc();
+     stopVenc();
+     stopVpss();
+-    stopVi();
++    /* DO NOT stop VI — same reason as VI_VENC path above. */
++    LOG_INFO("stopProcess: VPSS+VENC destroyed, VI left running\n");
+     break;
+   default:
+     LOG_ERROR("not support this type:%d\n", ctx->mFmtType);

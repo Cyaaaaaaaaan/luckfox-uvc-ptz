@@ -1,0 +1,47 @@
+--- a/project/app/uvc_app_tiny/uvc_app/uvc/camera_control.c
++++ b/project/app/uvc_app_tiny/uvc_app/uvc/camera_control.c
+@@ -1,6 +1,23 @@
+ /*
+  * Copyright (C) 2019 Rockchip Electronics Co., Ltd.
+  *
++ * Patch 0003: camera-control-isp-keepalive
++ *
++ * Problem:
++ *   The original camera_control_stop() called rk_isp_deinit() on every
++ *   streamoff event. This tears down the RK_AIQ context. When the host
++ *   re-opens the device (streamon), rk_isp_init() is called again —
++ *   but the ISP driver's internal SOF frame counter has continued
++ *   incrementing since the last capture. The AIQ context restarts its
++ *   own counter from zero. The mismatch causes "ISP sof disorder" errors
++ *   and a buffer flood that crashes the gadget.
++ *
++ * Fix:
++ *   camera_control_stop() becomes a no-op for the ISP/AIQ. The AIQ
++ *   context is kept alive for the entire lifetime of the process.
++ *   camera_control_deinit() (called only on process exit) still tears
++ *   down AIQ correctly.
++ *
++ *   camera_control_start() only adjusts the AIQ frame rate; it does not
++ *   reinitialise anything.
++ *
+  * This software is available to you under a choice of one of two
+  * licenses.  You may choose to be licensed under the terms of the GNU
+  * General Public License (GPL), available from the file
+@@ -53,8 +70,12 @@ int camera_control_start(int id, int width, int height, int fps, int format,
+
+ void camera_control_stop(int id) {
+   LOG_INFO("%s: id:%d\n", __func__, id);
+-  if (rk_param_get_int("video.source:enable_aiq", 1))
+-    (void)id; /* Keep ISP running across streamoff */
++  /* Intentional no-op: do NOT call rk_isp_deinit() here.
++   *
++   * The AIQ context must remain alive between streamoff/streamon cycles so
++   * the ISP SOF frame counter stays in sync. Tearing down AIQ resets its
++   * internal counters while the hardware counter keeps running, causing
++   * the "ISP sof disorder" flood on the next streamon.
++   *
++   * AIQ is torn down only in camera_control_deinit() on process exit. */
++  (void)id;
+ }
+
+ void camera_control_init() {

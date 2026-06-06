@@ -1,0 +1,153 @@
+--- a/project/app/uvc_app_tiny/uvc_app/usb_config.sh
++++ b/project/app/uvc_app_tiny/uvc_app/usb_config.sh
+@@ -1,6 +1,34 @@
+ #!/bin/sh
++#
++# Patch 0004: usb-config-mis5001-formats
++#
++# Changes:
++#   1. Single UVC function only (uvc.gs1 = "UVC RGB").
++#      The second function (uvc.gs0 / "RK_UVC") that caused OBS to enumerate
++#      two cameras has been removed entirely.
++#
++#   2. MJPEG frame interval table updated for MIS5001 native 2592x1944:
++#        2592x1944 — 15fps only (333333 = 10MHz units → 100ns units).
++#                    USB HS cannot sustain MJPEG at this res above ~15fps.
++#        1920x1080 — 30/25/15fps
++#        1280x720  — 30/25/15fps
++#        640x480   — 30fps (host compatibility, especially Windows Camera app)
++#
++#   3. H.264 frame interval table updated to match sensor capability.
++#      Native encoding via RV1106 VENC: 2592x1944@15, 1920x1080@30, etc.
++#
++#   4. H.265 retained at same resolutions as H.264.
++#
++#   5. dwMaxVideoFrameBufferSize for MJPEG increased to width*height*3 to
++#      give headroom for high-quality frames at low compression ratios.
++#      The original width*height*2 caused buffer overflows at high quality
++#      settings with the MIS5001 sensor output.
++#
++# Single-camera guarantee:
++#   Only uvc.gs1 is created and symlinked as f1.
++#   No uvc.gs0 is created anywhere in this script.
++#
+
+-# UVC_MULTI=off: single camera, full USB bandwidth
+-UVC_MULTI=off
+-CDC_ENABLE=NO
++CDC_ENABLE=NO
+
+ USB_FUNCTIONS_DIR=/sys/kernel/config/usb_gadget/rockchip/functions
+ USB_CONFIGS_DIR=/sys/kernel/config/usb_gadget/rockchip/configs/b.1
+
+@@ -13,10 +41,18 @@ configure_uvc_resolution_mjpeg()
+ {
+     UVC_DISPLAY_W=$1
+     UVC_DISPLAY_H=$2
++    UVC_DISPLAY_FPS=$3  # interval string, newline-separated (100ns units)
+     UVC_DISPLAY_DIR=${USB_FUNCTIONS_DIR}/$UVC_GS/streaming/mjpeg/m/${UVC_DISPLAY_W}_${UVC_DISPLAY_H}p
+     mkdir ${UVC_DISPLAY_DIR}
+     echo $UVC_DISPLAY_W > ${UVC_DISPLAY_DIR}/wWidth
+     echo $UVC_DISPLAY_H > ${UVC_DISPLAY_DIR}/wHeight
+-    echo 333333 > ${UVC_DISPLAY_DIR}/dwDefaultFrameInterval
+-    echo $((UVC_DISPLAY_W*UVC_DISPLAY_H*20)) > ${UVC_DISPLAY_DIR}/dwMinBitRate
+-    echo $((UVC_DISPLAY_W*UVC_DISPLAY_H*20)) > ${UVC_DISPLAY_DIR}/dwMaxBitRate
+-    echo $((UVC_DISPLAY_W*UVC_DISPLAY_H*2)) > ${UVC_DISPLAY_DIR}/dwMaxVideoFrameBufferSize
+-    echo -e "333333\n666666\n1000000\n2000000" > ${UVC_DISPLAY_DIR}/dwFrameInterval
++    # Default interval = first entry in the list
++    FIRST_INTERVAL=$(echo "$UVC_DISPLAY_FPS" | head -n1)
++    echo $FIRST_INTERVAL > ${UVC_DISPLAY_DIR}/dwDefaultFrameInterval
++    echo $((UVC_DISPLAY_W*UVC_DISPLAY_H*16)) > ${UVC_DISPLAY_DIR}/dwMinBitRate
++    echo $((UVC_DISPLAY_W*UVC_DISPLAY_H*16)) > ${UVC_DISPLAY_DIR}/dwMaxBitRate
++    # Use width*height*3 for generous MJPEG buffer (avoids overflow at high Q)
++    echo $((UVC_DISPLAY_W*UVC_DISPLAY_H*3)) > ${UVC_DISPLAY_DIR}/dwMaxVideoFrameBufferSize
++    printf "%s\n" $UVC_DISPLAY_FPS > ${UVC_DISPLAY_DIR}/dwFrameInterval
+ }
+
+ configure_uvc_resolution_h264()
+@@ -24,10 +60,11 @@ configure_uvc_resolution_h264()
+ {
+     UVC_DISPLAY_W=$1
+     UVC_DISPLAY_H=$2
++    UVC_DISPLAY_FPS=$3
+     UVC_DISPLAY_DIR=${USB_FUNCTIONS_DIR}/$UVC_GS/streaming/framebased/f1/${UVC_DISPLAY_W}_${UVC_DISPLAY_H}p
+     mkdir ${UVC_DISPLAY_DIR}
+     echo $UVC_DISPLAY_W > ${UVC_DISPLAY_DIR}/wWidth
+     echo $UVC_DISPLAY_H > ${UVC_DISPLAY_DIR}/wHeight
+-    echo 333333 > ${UVC_DISPLAY_DIR}/dwDefaultFrameInterval
+-    echo $((UVC_DISPLAY_W*UVC_DISPLAY_H*10)) > ${UVC_DISPLAY_DIR}/dwMinBitRate
+-    echo $((UVC_DISPLAY_W*UVC_DISPLAY_H*10)) > ${UVC_DISPLAY_DIR}/dwMaxBitRate
+-    echo -e "333333\n400000\n500000\n666666\n1000000\n2000000" > ${UVC_DISPLAY_DIR}/dwFrameInterval
++    FIRST_INTERVAL=$(echo "$UVC_DISPLAY_FPS" | head -n1)
++    echo $FIRST_INTERVAL > ${UVC_DISPLAY_DIR}/dwDefaultFrameInterval
++    echo $((UVC_DISPLAY_W*UVC_DISPLAY_H*8)) > ${UVC_DISPLAY_DIR}/dwMinBitRate
++    echo $((UVC_DISPLAY_W*UVC_DISPLAY_H*16)) > ${UVC_DISPLAY_DIR}/dwMaxBitRate
++    printf "%s\n" $UVC_DISPLAY_FPS > ${UVC_DISPLAY_DIR}/dwFrameInterval
+     echo -ne \\x48\\x32\\x36\\x34\\x00\\x00\\x10\\x00\\x80\\x00\\x00\\xaa\\x00\\x38\\x9b\\x71 > ${USB_FUNCTIONS_DIR}/$UVC_GS/streaming/framebased/f1/guidFormat
+ }
+
+@@ -35,10 +72,11 @@ configure_uvc_resolution_h265()
+ {
+     UVC_DISPLAY_W=$1
+     UVC_DISPLAY_H=$2
++    UVC_DISPLAY_FPS=$3
+     UVC_DISPLAY_DIR=${USB_FUNCTIONS_DIR}/$UVC_GS/streaming/framebased/f2/${UVC_DISPLAY_W}_${UVC_DISPLAY_H}p
+     mkdir ${UVC_DISPLAY_DIR}
+     echo $UVC_DISPLAY_W > ${UVC_DISPLAY_DIR}/wWidth
+     echo $UVC_DISPLAY_H > ${UVC_DISPLAY_DIR}/wHeight
+-    echo 333333 > ${UVC_DISPLAY_DIR}/dwDefaultFrameInterval
+-    echo $((UVC_DISPLAY_W*UVC_DISPLAY_H*10)) > ${UVC_DISPLAY_DIR}/dwMinBitRate
+-    echo $((UVC_DISPLAY_W*UVC_DISPLAY_H*10)) > ${UVC_DISPLAY_DIR}/dwMaxBitRate
+-    echo -e "333333\n400000\n500000\n666666" > ${UVC_DISPLAY_DIR}/dwFrameInterval
++    FIRST_INTERVAL=$(echo "$UVC_DISPLAY_FPS" | head -n1)
++    echo $FIRST_INTERVAL > ${UVC_DISPLAY_DIR}/dwDefaultFrameInterval
++    echo $((UVC_DISPLAY_W*UVC_DISPLAY_H*8)) > ${UVC_DISPLAY_DIR}/dwMinBitRate
++    echo $((UVC_DISPLAY_W*UVC_DISPLAY_H*16)) > ${UVC_DISPLAY_DIR}/dwMaxBitRate
++    printf "%s\n" $UVC_DISPLAY_FPS > ${UVC_DISPLAY_DIR}/dwFrameInterval
+     echo -ne \\x48\\x32\\x36\\x35\\x00\\x00\\x10\\x00\\x80\\x00\\x00\\xaa\\x00\\x38\\x9b\\x71 > ${USB_FUNCTIONS_DIR}/$UVC_GS/streaming/framebased/f2/guidFormat
+ }
+
+@@ -55,20 +93,38 @@ uvc_device_config()
+     ln -s ${USB_FUNCTIONS_DIR}/$UVC_GS/control/header/h ${USB_FUNCTIONS_DIR}/$UVC_GS/control/class/ss/h
+
+     ## MJPEG
++    # Frame intervals in 100ns units:
++    #   333333  = 30fps
++    #   400000  = 25fps
++    #   666666  = 15fps
++    #  1000000  = 10fps
++    #  2000000  =  5fps
+     mkdir ${USB_FUNCTIONS_DIR}/$UVC_GS/streaming/mjpeg/m
+-    configure_uvc_resolution_mjpeg 1280 720
+-    configure_uvc_resolution_mjpeg 1920 1080
+-    configure_uvc_resolution_mjpeg 2048 1536
+-    configure_uvc_resolution_mjpeg 2592 1944
++    configure_uvc_resolution_mjpeg  640  480 "333333"
++    configure_uvc_resolution_mjpeg 1280  720 "333333 400000 666666"
++    configure_uvc_resolution_mjpeg 1920 1080 "333333 400000 666666"
++    configure_uvc_resolution_mjpeg 2592 1944 "666666 1000000 2000000"
+
+     ## H.264
+     mkdir ${USB_FUNCTIONS_DIR}/$UVC_GS/streaming/framebased/f1
+-    configure_uvc_resolution_h264 1280 720
+-    configure_uvc_resolution_h264 1920 1080
+-    configure_uvc_resolution_h264 2048 1536
+-    configure_uvc_resolution_h264 2592 1944
++    configure_uvc_resolution_h264  640  480 "333333"
++    configure_uvc_resolution_h264 1280  720 "333333 400000 666666"
++    configure_uvc_resolution_h264 1920 1080 "333333 400000 666666"
++    configure_uvc_resolution_h264 2592 1944 "666666 1000000 2000000"
+
+     ## H.265
+     mkdir ${USB_FUNCTIONS_DIR}/$UVC_GS/streaming/framebased/f2
+-    configure_uvc_resolution_h265 1280 720
+-    configure_uvc_resolution_h265 1920 1080
+-    configure_uvc_resolution_h265 2048 1536
+-    configure_uvc_resolution_h265 2592 1944
++    configure_uvc_resolution_h265  640  480 "333333"
++    configure_uvc_resolution_h265 1280  720 "333333 400000 666666"
++    configure_uvc_resolution_h265 1920 1080 "333333 400000 666666"
++    configure_uvc_resolution_h265 2592 1944 "666666 1000000 2000000"
+
+     mkdir /sys/kernel/config/usb_gadget/rockchip/functions/$UVC_GS/streaming/header/h
+     ln -s ${USB_FUNCTIONS_DIR}/$UVC_GS/streaming/mjpeg/m ${USB_FUNCTIONS_DIR}/$UVC_GS/streaming/header/h/m

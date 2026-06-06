@@ -1,0 +1,103 @@
+--- a/project/app/uvc_app_tiny/uvc_app/RkLunch.sh
++++ b/project/app/uvc_app_tiny/uvc_app/RkLunch.sh
+@@ -1,4 +1,24 @@
+ #!/bin/sh
++#
++# Patch 0005: rklunch-disable-rkipc
++#
++# Changes:
++#   1. Kill rkipc unconditionally at startup and remove it from any init.d
++#      slot so it can never race with our UVC stack during boot.
++#
++#   2. Kill adbd at startup. ADB reconnection events generate USB bus resets
++#      which interrupt the UVC gadget transfer mid-stream, causing the host
++#      to see buffer errors. adbd is killed before usb_config.sh runs.
++#
++#   3. Watchdog loop in check_usb_state() simplified: it no longer tries to
++#      restart adbd. If rk_mpi_uvc dies it resets the UDC and restarts
++      the UVC stack cleanly without touching ADB.
++#
++#   4. The 2-second watchdog interval is retained. A /tmp/uvc_stop_check
++#      sentinel file still exits the loop cleanly.
++#
++#   5. rk_mpi_uvc is always started with -c /tmp/rkuvc.ini when the ini
++#      exists, and with -a /oem/usr/share/iqfiles when iqfiles exist.
++#      The iqfiles directory contains MIS5001 AIQ tuning files.
++#
+
++disable_rkipc()
++{
++    # Kill any running rkipc instance immediately
++    killall rkipc 2>/dev/null
++    killall -9 rkipc 2>/dev/null
++
++    # Remove rkipc from every init.d slot it might occupy
++    for f in /etc/init.d/S*rkipc /oem/etc/init.d/S*rkipc; do
++        [ -f "$f" ] && mv "$f" "${f}.disabled" && \
++            echo "Disabled: $f"
++    done
++
++    # Also disable the generic RkLunch that starts rkipc if it is not ours
++    if [ -f "/etc/init.d/S99RkLunch" ]; then
++        grep -q "rkipc" /etc/init.d/S99RkLunch && \
++            mv /etc/init.d/S99RkLunch /etc/init.d/S99RkLunch.disabled && \
++            echo "Disabled: /etc/init.d/S99RkLunch (contained rkipc)"
++    fi
++}
++
+ check_usb_state()
+ {
+    if [[ ! -f "/oem/usr/bin/rk_mpi_uvc"  && ! -f "/usr/bin/rk_mpi_uvc" ]]; then
+@@ -8,16 +28,19 @@ check_usb_state()
+   PID=`ps |grep rk_mpi_uvc |grep -v grep | wc -l`
+   if [ $PID -le 0 ];then
+        echo " exit rk_mpi_uvc ,restart it for uvc recovery..."
+-       killall adbd
+-       sleep 1
+-       killall -9 adbd
++       # Do NOT restart adbd — ADB reconnection causes USB bus reset which
++       # interrupts the UVC gadget. ADB stays dead for the session.
+        rm -rf /sys/kernel/config/usb_gadget/rockchip/configs/b.1/f*
+        echo none > /sys/kernel/config/usb_gadget/rockchip/UDC
+-       rmdir /sys/kernel/config/usb_gadget/rockchip/functions/ffs.adb
+-       rmdir /sys/kernel/config/usb_gadget/rockchip/functions/uac*
+        UDC=`ls /sys/class/udc/| awk '{print $1}'`
+        echo $UDC  > /sys/bus/platform/drivers/dwc3/unbind
+        echo $UDC  > /sys/bus/platform/drivers/dwc3/bind
+-       /oem/usr/bin/usb_config.sh uac1 #off #disable adb
++       /oem/usr/bin/usb_config.sh
+        if [ -d "/oem/usr/share/iqfiles" ];then
+                rk_mpi_uvc -c /tmp/rkuvc.ini -a /oem/usr/share/iqfiles &
+        else
+@@ -35,6 +58,16 @@ post_chk()
+                sleep .1
+         done
+
++        # --- Disable rkipc before anything USB-related starts ---
++        disable_rkipc
++
++        # Kill adbd before configuring the USB gadget.
++        # ADB and UVC share the same USB port; adbd reconnection events
++        # generate bus resets that corrupt in-flight UVC transfers.
++        killall adbd 2>/dev/null
++        sleep 0.5
++        killall -9 adbd 2>/dev/null
++        # Prevent S99usb0config from re-enabling ADB later
++        [ -f "/etc/init.d/S99usb0config" ] && \
++            mv /etc/init.d/S99usb0config /etc/init.d/S99usb0config.disabled
++
+         # if ko exist, install ko first
+         default_ko_dir=/ko
+         if [ -f "/oem/usr/ko/insmod_ko.sh" ];then
+@@ -60,7 +93,8 @@ post_chk()
+         export rt_log_level=3
+         export rk_mpi_uvc_log_level=2
+         export uac_app_log_level=2
+
+         touch /tmp/uvc_no_timeout
+-        /oem/usr/bin/usb_config.sh uac1
++        # Run USB gadget config (single UVC function, no ADB, no UAC)
++        /oem/usr/bin/usb_config.sh
+         ifconfig lo 127.0.0.1
+
+         if [ -d "/oem/usr/share/iqfiles" ];then

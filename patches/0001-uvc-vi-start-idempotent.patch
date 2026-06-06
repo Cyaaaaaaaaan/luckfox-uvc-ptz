@@ -1,0 +1,188 @@
+--- a/project/app/uvc_app_tiny/uvc_app/uvc/uvc_mpi_vi.cpp
++++ b/project/app/uvc_app_tiny/uvc_app/uvc/uvc_mpi_vi.cpp
+@@ -1,6 +1,17 @@
+ /*
+  * Copyright (C) 2019 Rockchip Electronics Co., Ltd.
+  *
++ * Patch 0001: uvc-vi-start-idempotent
++ *
++ * Problem:
++ *   uvc_vi_start() was calling RK_MPI_VI_DisableChn() followed by
++ *   uvc_vi_config() (which calls SetDevAttr/EnableDev/SetDevBindPipe) on
++ *   every streamon event. When the ISP/AIQ context is already live this
++ *   causes an ISP SOF frame-counter desync and hard crash, especially on
++ *   resolution changes triggered by the host.
++ *
++ * Fix:
++ *   Track device-init state with a static flag. Device and pipe are
++ *   configured exactly once at first streamon. Subsequent streamon calls
++ *   only re-enable the VI channel (which is safe while VI pipe is running).
++ *   uvc_vi_stop() remains a no-op so the ISP SOF counter never resets.
++ *   VENC is the only component that restarts between cycles.
++ *
+  * This software is available to you under a choice of one of two
+  * licenses.  You may choose to be licensed under the terms of the GNU
+  * General Public License (GPL), available from the file
+@@ -26,9 +37,14 @@
+  * SOFTWARE.
+  */
+ #include "uvc_mpi_vi.h"
++#include "rk_mpi_sys.h"
+ #include "rk_mpi_vi.h"
+ #include "uvc_log.h"
+ #include "uvc_video.h"
+ #include <cstring>
++#include <pthread.h>
++
++/* Tracks whether the VI device/pipe has been initialised for each channel. */
++static int s_vi_dev_inited[2] = {0, 0}; /* indexed by chnType (max 2) */
++static pthread_mutex_t s_vi_init_mutex = PTHREAD_MUTEX_INITIALIZER;
+
+ typedef struct _rkMpiVICtx {
+   UVC_VI_CHN_CTX_S stChnCtx;
+@@ -152,41 +168,71 @@ RK_S32 uvc_vi_config(UVC_MPI_CFG *uvcCfg, MpiViChannelType chnType) {
+   MPI_VI_CTX_S ctx;
+   ctx = uvc_get_vi_ctx(uvcCfg, chnType);
+
+-  // 0. get dev config status
+-  s32Ret = RK_MPI_VI_GetDevAttr(ctx.stChnCtx.devId, &ctx.stDevAttr);
+-  if (s32Ret == RK_ERR_VI_NOT_CONFIG) {
+-    // 0-1.config dev
+-    s32Ret = RK_MPI_VI_SetDevAttr(ctx.stChnCtx.devId, &ctx.stDevAttr);
+-    if (s32Ret != RK_SUCCESS) {
+-      LOG_ERROR("RK_MPI_VI_SetDevAttr %x\n", s32Ret);
+-      goto __FAILED;
++  pthread_mutex_lock(&s_vi_init_mutex);
++  if (!s_vi_dev_inited[chnType]) {
++    /* ---------------------------------------------------------------
++     * One-time device + pipe init.  Never repeat while ISP is running
++     * or the SOF counter will desync and crash the pipeline.
++     * --------------------------------------------------------------- */
++
++    // 0. get dev config status
++    s32Ret = RK_MPI_VI_GetDevAttr(ctx.stChnCtx.devId, &ctx.stDevAttr);
++    if (s32Ret == RK_ERR_VI_NOT_CONFIG) {
++      // 0-1. config dev
++      s32Ret = RK_MPI_VI_SetDevAttr(ctx.stChnCtx.devId, &ctx.stDevAttr);
++      if (s32Ret != RK_SUCCESS) {
++        LOG_ERROR("RK_MPI_VI_SetDevAttr %x\n", s32Ret);
++        pthread_mutex_unlock(&s_vi_init_mutex);
++        goto __FAILED;
++      }
+     }
+-  }
+-  // 1.get  dev enable status
+-  s32Ret = RK_MPI_VI_GetDevIsEnable(ctx.stChnCtx.devId);
+-  if (s32Ret != RK_SUCCESS) {
+-    // 1-2.enable dev
+-    s32Ret = RK_MPI_VI_EnableDev(ctx.stChnCtx.devId);
+-    if (s32Ret != RK_SUCCESS) {
+-      LOG_ERROR("RK_MPI_VI_EnableDev %x\n", s32Ret);
+-      goto __FAILED;
++
++    // 1. get dev enable status
++    s32Ret = RK_MPI_VI_GetDevIsEnable(ctx.stChnCtx.devId);
++    if (s32Ret != RK_SUCCESS) {
++      // 1-2. enable dev
++      s32Ret = RK_MPI_VI_EnableDev(ctx.stChnCtx.devId);
++      if (s32Ret != RK_SUCCESS) {
++        LOG_ERROR("RK_MPI_VI_EnableDev %x\n", s32Ret);
++        pthread_mutex_unlock(&s_vi_init_mutex);
++        goto __FAILED;
++      }
++      // 1-3. bind dev/pipe
++      ctx.stBindPipe.u32Num = ctx.stChnCtx.pipeId;
++      ctx.stBindPipe.PipeId[0] = ctx.stChnCtx.pipeId;
++      s32Ret = RK_MPI_VI_SetDevBindPipe(ctx.stChnCtx.devId, &ctx.stBindPipe);
++      if (s32Ret != RK_SUCCESS) {
++        LOG_ERROR("RK_MPI_VI_SetDevBindPipe %x\n", s32Ret);
++        pthread_mutex_unlock(&s_vi_init_mutex);
++        goto __FAILED;
++      }
+     }
+-    // 1-3.bind dev/pipe
+-    ctx.stBindPipe.u32Num = ctx.stChnCtx.pipeId;
+-    ctx.stBindPipe.PipeId[0] = ctx.stChnCtx.pipeId;
+-    s32Ret = RK_MPI_VI_SetDevBindPipe(ctx.stChnCtx.devId, &ctx.stBindPipe);
++
++    // 2. config channel (first time only)
++    s32Ret = RK_MPI_VI_SetChnAttr(ctx.stChnCtx.pipeId, ctx.stChnCtx.channelId,
++                                  &ctx.stChnAttr);
+     if (s32Ret != RK_SUCCESS) {
+-      LOG_ERROR("RK_MPI_VI_SetDevBindPipe %x\n", s32Ret);
+-      goto __FAILED;
++      LOG_ERROR("RK_MPI_VI_SetChnAttr %x\n", s32Ret);
++      pthread_mutex_unlock(&s_vi_init_mutex);
++      goto __FAILED;
+     }
+-  }
+-  // 2.config channel
+-  s32Ret = RK_MPI_VI_SetChnAttr(ctx.stChnCtx.pipeId, ctx.stChnCtx.channelId,
+-                                &ctx.stChnAttr);
+-  if (s32Ret != RK_SUCCESS) {
+-    LOG_ERROR("RK_MPI_VI_SetChnAttr %x\n", s32Ret);
+-    goto __FAILED;
++
++    s_vi_dev_inited[chnType] = 1;
++    LOG_INFO("uvc_vi_config: device/pipe/channel configured for chnType %d\n",
++             chnType);
++  } else {
++    /* Device already running — VI output size is fixed at 2592x1944 (native
++     * sensor resolution). VPSS handles all downscaling transparently.
++     * Do NOT reconfigure the device or pipe here. */
++    LOG_INFO("uvc_vi_config: device already initialised for chnType %d, "
++             "skipping device/pipe reconfiguration\n", chnType);
++    s32Ret = RK_SUCCESS;
+   }
++  pthread_mutex_unlock(&s_vi_init_mutex);
+
+ __FAILED:
+   return s32Ret;
+@@ -196,22 +242,29 @@ RK_S32 uvc_vi_start(UVC_MPI_CFG uvcCfg, MpiViChannelType chnType) {
+   RK_S32 s32Ret = RK_FAILURE;
+   UVC_VI_CHN_CTX_S ctx;
+   ctx = uvc_get_vi_chn_ctx(uvcCfg, chnType);
+
+-  // disable first so SetChnAttr works on live channel
+-  RK_MPI_VI_DisableChn(ctx.pipeId, ctx.channelId);
+-  // reconfigure channel attrs (resolution may have changed)
+-  uvc_vi_config(&uvcCfg, chnType);
+-  // isp&aiq init here
+-
+-  // 3.enable channel
+-  LOG_INFO("RK_MPI_VI_EnableChn %x %d %d\n", ctx.devId, ctx.pipeId,
+-           ctx.channelId);
+-  s32Ret = RK_MPI_VI_EnableChn(ctx.pipeId, ctx.channelId);
++  /* Run one-time device/pipe/channel config (idempotent after first call). */
++  s32Ret = uvc_vi_config(&uvcCfg, chnType);
+   if (s32Ret != RK_SUCCESS) {
+-    LOG_INFO("RK_MPI_VI_EnableChn returned %x (may already be enabled, continuing)\n", s32Ret);
+-    s32Ret = RK_SUCCESS; /* ignore error if already running */
++    LOG_ERROR("uvc_vi_config failed %x\n", s32Ret);
++    goto __FAILED;
+   }
+
++  pthread_mutex_lock(&s_vi_init_mutex);
++  if (s_vi_dev_inited[chnType] == 1) {
++    /* First streamon — enable the channel for the first time. */
++    LOG_INFO("uvc_vi_start: first EnableChn dev=%d pipe=%d chn=%d\n",
++             ctx.devId, ctx.pipeId, ctx.channelId);
++    s32Ret = RK_MPI_VI_EnableChn(ctx.pipeId, ctx.channelId);
++    if (s32Ret != RK_SUCCESS) {
++      LOG_ERROR("RK_MPI_VI_EnableChn %x\n", s32Ret);
++      pthread_mutex_unlock(&s_vi_init_mutex);
++      goto __FAILED;
++    }
++    s_vi_dev_inited[chnType] = 2; /* 2 = device + channel both running */
++  } else {
++    /* Subsequent streamon — VI channel is already running, leave it alone.
++     * VPSS will deliver frames at whatever resolution it is configured for. */
++    LOG_INFO("uvc_vi_start: VI channel already running, no-op (chnType %d)\n",
++             chnType);
++    s32Ret = RK_SUCCESS;
++  }
++  pthread_mutex_unlock(&s_vi_init_mutex);
++
+ __FAILED:
+   return s32Ret;
+ }
