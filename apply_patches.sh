@@ -803,11 +803,12 @@ ok "Patch 6 complete: $CFG_FILE"
 #   OVERLAY_RGN strips (full-frame overlay and COVER_RGN are non-functional
 #   at 2592×1944 on this SDK).
 #
-#   Requires: /oem/usr/share/models/retinaface.rknn on the target device.
-#   Model source: luckfox_pico_rkmpi_example retinaface example.
+#   Model bundled at files/models/retinaface.rknn — deploy to
+#   /oem/usr/share/models/retinaface.rknn on the target device.
 # ═════════════════════════════════════════════════════════════════════════════
 SCRIPT_DIR_ABS="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 FILES_UVC="$SCRIPT_DIR_ABS/files/uvc"
+FILES_MODELS="$SCRIPT_DIR_ABS/files/models"
 CMAKE_FILE="$UVC_SRC/CMakeLists.txt"
 MAIN_FILE="$UVC_SRC/main.c"
 PROC_FILE7="$UVC_SRC/uvc/uvc_process.cpp"

@@ -54,12 +54,7 @@ The model file must be deployed to the board (see Deploy section).
 - ARM cross-toolchain (included in the SDK via git-lfs)
 - Board flashed with factory firmware (the `/oem` partition must exist)
 - SSH access to the board
-- **RetinaFace model** for face detection (Patch 7):
-  ```sh
-  # From the luckfox_pico_rkmpi_example repo:
-  git clone https://github.com/LuckfoxTECH/luckfox_pico_rkmpi_example.git
-  # Model path: luckfox_pico_rkmpi_example/example/luckfox_pico_rtsp_retinaface/model/retinaface.rknn
-  ```
+- **RetinaFace model** — bundled in this repo at `files/models/retinaface.rknn` (637 KB). No separate download needed; `build-app.sh` references it automatically.
 
 ## Build
 
@@ -86,7 +81,7 @@ export PICO_IP=<board IP>        # e.g. 192.168.1.149
 # Paths (adjust if your SDK/repo are elsewhere)
 UVC_BIN=~/luckfox-pico/project/app/uvc_app_tiny/out/bin/rk_mpi_uvc
 UVC_SRC=~/luckfox-pico/project/app/uvc_app_tiny/uvc_app
-RETINA_MODEL=~/luckfox_pico_rkmpi_example/example/luckfox_pico_rtsp_retinaface/model/retinaface.rknn
+RETINA_MODEL=~/luckfox-uvc-ptz/files/models/retinaface.rknn
 
 # 0. One-time: back up the factory launcher
 ssh root@$PICO_IP "cp /oem/usr/bin/RkLunch.sh /oem/usr/bin/RkLunch.sh.factory"
