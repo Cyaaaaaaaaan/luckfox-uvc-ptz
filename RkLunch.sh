@@ -68,7 +68,12 @@ post_chk() {
     export rk_mpi_uvc_log_level=2
     touch /tmp/uvc_no_timeout
 
-    # Start rk_mpi_uvc and watchdog it
+    # Start VISCA PTZ server (background, watchdog loop below)
+    if [ -x /oem/usr/bin/visca_server ]; then
+        /oem/usr/bin/visca_server &
+    fi
+
+    # Start rk_mpi_uvc and watchdog both processes
     if [ -d "/oem/usr/share/iqfiles" ]; then
         /oem/usr/bin/rk_mpi_uvc -c /tmp/rkuvc.ini -a /oem/usr/share/iqfiles &
     else
@@ -85,6 +90,10 @@ post_chk() {
             else
                 /oem/usr/bin/rk_mpi_uvc &
             fi
+        fi
+        if [ -x /oem/usr/bin/visca_server ] && ! ps | grep -q "[v]isca_server"; then
+            echo "RkLunch: visca_server died — restarting..."
+            /oem/usr/bin/visca_server &
         fi
     done
 }

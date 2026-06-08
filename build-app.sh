@@ -125,7 +125,24 @@ if [[ $BUILD_EXIT -ne 0 ]]; then
 fi
 
 # --------------------------------------------------------------------------- #
-#  4. Locate output binary & Deploy
+#  4. Build visca_server
+# --------------------------------------------------------------------------- #
+VISCA_SRC="$SCRIPT_DIR/visca"
+VISCA_BUILD="$SCRIPT_DIR/visca/build"
+VISCA_BIN="$VISCA_BUILD/visca_server"
+
+info "Building visca_server..."
+cmake -S "$VISCA_SRC" -B "$VISCA_BUILD" \
+    -DCMAKE_C_COMPILER=arm-rockchip830-linux-uclibcgnueabihf-gcc \
+    -DCMAKE_BUILD_TYPE=Release \
+    -DCMAKE_INSTALL_PREFIX="$VISCA_BUILD/install" \
+    -Wno-dev -DCMAKE_SYSTEM_NAME=Linux >/dev/null
+cmake --build "$VISCA_BUILD" -j"$(nproc)" 2>&1 | tee -a "$SDK_DIR/build_app.log"
+[[ -f "$VISCA_BIN" ]] || error "visca_server build failed"
+ok "visca_server: $VISCA_BIN"
+
+# --------------------------------------------------------------------------- #
+#  5. Locate output binary & Deploy
 # --------------------------------------------------------------------------- #
 UVC_BIN_CANDIDATES=(
     "$SDK_DIR/project/app/uvc_app_tiny/out/bin/rk_mpi_uvc"
@@ -162,21 +179,24 @@ echo "  # Stage everything through /tmp first, then kill+remount+move in one SSH
 echo ""
 RETINA_MODEL="$SCRIPT_DIR/files/models/retinaface.rknn"
 echo "  # 1. Stage files to /tmp (always writable, no kill needed)"
-echo "  scp \"$UVC_BIN\" root@\$PICO_IP:/tmp/rk_mpi_uvc"
+echo "  scp \"$UVC_BIN\"    root@\$PICO_IP:/tmp/rk_mpi_uvc"
+echo "  scp \"$VISCA_BIN\"  root@\$PICO_IP:/tmp/visca_server"
 echo "  scp \"$UVC_SCRIPTS_DIR/usb_config.sh\" root@\$PICO_IP:/tmp/usb_config.sh"
 echo "  scp \"$UVC_SCRIPTS_DIR/rkuvc.ini\" root@\$PICO_IP:/tmp/rkuvc.ini.new"
 echo "  scp \"$RKLUNCH_SH\" root@\$PICO_IP:/tmp/RkLunch.sh"
 echo "  scp \"$RETINA_MODEL\" root@\$PICO_IP:/tmp/retinaface.rknn"
 echo ""
-echo "  # 2. Kill running binary, remount /oem rw, install, reboot"
+echo "  # 2. Kill running binaries, remount /oem rw, install, reboot"
 echo "  ssh root@\$PICO_IP \\"
-echo "    \"killall -9 rk_mpi_uvc 2>/dev/null; mount -o remount,rw /oem && \\"
-echo "      cp /tmp/rk_mpi_uvc  /oem/usr/bin/rk_mpi_uvc && \\"
+echo "    \"killall -9 rk_mpi_uvc visca_server 2>/dev/null; mount -o remount,rw /oem && \\"
+echo "      cp /tmp/rk_mpi_uvc    /oem/usr/bin/rk_mpi_uvc && \\"
+echo "      cp /tmp/visca_server  /oem/usr/bin/visca_server && \\"
 echo "      cp /tmp/usb_config.sh /oem/usr/bin/usb_config.sh && \\"
 echo "      cp /tmp/rkuvc.ini.new /oem/usr/share/rkuvc.ini && \\"
-echo "      cp /tmp/RkLunch.sh   /oem/usr/bin/RkLunch.sh && \\"
+echo "      cp /tmp/RkLunch.sh    /oem/usr/bin/RkLunch.sh && \\"
 echo "      mkdir -p /oem/usr/share/models && \\"
 echo "      cp /tmp/retinaface.rknn /oem/usr/share/models/ && \\"
-echo "      chmod +x /oem/usr/bin/rk_mpi_uvc /oem/usr/bin/usb_config.sh /oem/usr/bin/RkLunch.sh && \\"
+echo "      chmod +x /oem/usr/bin/rk_mpi_uvc /oem/usr/bin/visca_server \\"
+echo "               /oem/usr/bin/usb_config.sh /oem/usr/bin/RkLunch.sh && \\"
 echo "      reboot\""
 echo ""
