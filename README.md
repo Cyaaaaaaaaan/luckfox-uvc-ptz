@@ -126,14 +126,22 @@ echo -ne '\x81\x01\x06\x01\x01\x00\x01\x03\xff' | nc -u -q1 127.0.0.1 1259
 git clone https://github.com/Cyaaaaaaaaan/luckfox-uvc-ptz.git ~/luckfox-uvc-ptz
 cd ~/luckfox-uvc-ptz
 
-# Patch the SDK and build rk_mpi_uvc + visca_server
+# Build everything (rk_mpi_uvc + visca_server)
 bash build-app.sh
 
-# If your SDK is elsewhere:
-SDK_DIR=/path/to/luckfox-pico bash build-app.sh
+# Build only rk_mpi_uvc (full SDK path, patches applied)
+bash build-app.sh --target uvc
+
+# Build only visca_server (fast — no SDK build system involved)
+bash build-app.sh --target visca
+
+# Other options
+bash build-app.sh --target uvc --skip-patches   # skip apply_patches.sh
+bash build-app.sh --target all --clean          # clean before build
+bash build-app.sh --sdk /path/to/luckfox-pico   # custom SDK path
 ```
 
-After a successful build, the script prints exact `scp`/`ssh` deploy commands with resolved paths.
+After a successful build, the script prints exact `scp`/`ssh` deploy commands — only for the components that were built.
 
 ## Deploy
 
