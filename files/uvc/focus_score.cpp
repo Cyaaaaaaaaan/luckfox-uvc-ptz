@@ -1,0 +1,741 @@
+#include "focus_score.h"
+#include "uvc_mpi_vi.h"
+#include "uvc_log.h"
+#include "rk_mpi_vi.h"
+#include "rk_mpi_mb.h"
+#include "rk_mpi_sys.h"
+#if FOCUS_SCORE_OSD
+#include "rk_mpi_rgn.h"
+#include "rk_mpi_venc.h"
+#endif
+#if FOCUS_SCORE_FACE_DETECT
+#include "rknn_api.h"
+#include "rknn_box_priors.h"
+#include <math.h>
+#include <climits>
+#endif
+#include <pthread.h>
+#include <stdio.h>
+#include <stdint.h>
+#include <string.h>
+#include <stdlib.h>
+#include <unistd.h>
+
+#define FOCUS_SCORE_PATH  "/tmp/focus_score"
+#define SCORE_CROP_W      320
+#define SCORE_CROP_H      240
+#define SCORE_INTERVAL_US 500000
+#define GETFRAME_TIMEOUT  200
+
+static pthread_t       s_tid;
+static volatile int    s_quit    = 0;
+static volatile double s_score   = 0.0;
+static int             s_pipe_id = 0;
+static int             s_chn_id  = 0;
+
+/* --------------------------------------------------------------------------
+ * Tenengrad focus measure: mean squared Sobel gradient energy.
+ * Score peaks sharply at focus for any scene content.
+ * -------------------------------------------------------------------------- */
+static double tenengrad_score(const uint8_t *y, int stride,
+                               int cx, int cy, int cw, int ch)
+{
+    long long sum_sq = 0;
+    long      n      = 0;
+
+    for (int row = 1; row < ch - 1; row++) {
+        int fy = cy + row;
+        const uint8_t *row_cur  = y + fy       * stride;
+        const uint8_t *row_prev = y + (fy - 1) * stride;
+        const uint8_t *row_next = y + (fy + 1) * stride;
+        for (int col = 1; col < cw - 1; col++) {
+            int fx = cx + col;
+            int gx = (int)row_cur[fx + 1]  - (int)row_cur[fx - 1];
+            int gy = (int)row_next[fx]      - (int)row_prev[fx];
+            sum_sq += gx * gx + gy * gy;
+            n++;
+        }
+    }
+    return (n == 0) ? 0.0 : (double)sum_sq / n;
+}
+
+/* ==========================================================================
+ * OSD overlay — compiled out when FOCUS_SCORE_OSD == 0
+ * ========================================================================== */
+#if FOCUS_SCORE_OSD
+
+/* 8×8 bitmap font — digits 0-9, '.', 'F', 'S', ':', ' '
+ * Each byte is one row, MSB = leftmost pixel.               */
+static const uint8_t s_font[][8] = {
+    /* 0 */ { 0x3C, 0x66, 0x6E, 0x76, 0x66, 0x66, 0x3C, 0x00 },
+    /* 1 */ { 0x18, 0x38, 0x18, 0x18, 0x18, 0x18, 0x7E, 0x00 },
+    /* 2 */ { 0x3C, 0x66, 0x06, 0x0C, 0x18, 0x30, 0x7E, 0x00 },
+    /* 3 */ { 0x3C, 0x66, 0x06, 0x1C, 0x06, 0x66, 0x3C, 0x00 },
+    /* 4 */ { 0x06, 0x0E, 0x1E, 0x66, 0x7F, 0x06, 0x06, 0x00 },
+    /* 5 */ { 0x7F, 0x60, 0x7C, 0x06, 0x06, 0x66, 0x3C, 0x00 },
+    /* 6 */ { 0x1C, 0x30, 0x60, 0x7C, 0x66, 0x66, 0x3C, 0x00 },
+    /* 7 */ { 0x7F, 0x66, 0x0C, 0x18, 0x18, 0x18, 0x18, 0x00 },
+    /* 8 */ { 0x3C, 0x66, 0x66, 0x3C, 0x66, 0x66, 0x3C, 0x00 },
+    /* 9 */ { 0x3C, 0x66, 0x66, 0x3E, 0x06, 0x0C, 0x38, 0x00 },
+    /* . */ { 0x00, 0x00, 0x00, 0x00, 0x00, 0x18, 0x18, 0x00 },
+    /* F */ { 0x7E, 0x60, 0x60, 0x7C, 0x60, 0x60, 0x60, 0x00 },
+    /* S */ { 0x3C, 0x66, 0x60, 0x3C, 0x06, 0x66, 0x3C, 0x00 },
+    /* : */ { 0x00, 0x18, 0x18, 0x00, 0x18, 0x18, 0x00, 0x00 },
+    /* ' '*/{ 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00 },
+};
+
+static int char_idx(char c) {
+    if (c >= '0' && c <= '9') return c - '0';
+    if (c == '.')  return 10;
+    if (c == 'F')  return 11;
+    if (c == 'S')  return 12;
+    if (c == ':')  return 13;
+    return 14;
+}
+
+/* RK_FMT_RGBA8888 in memory: [R, G, B, A] bytes → uint32 = 0xAABBGGRR */
+#define RGBA(r,g,b,a) ((uint32_t)((a)<<24|(b)<<16|(g)<<8|(r)))
+#define OSD_FG        RGBA(0xFF,0xFF,0xFF,0xFF)  /* white, opaque        */
+#define OSD_BG        RGBA(0x00,0x00,0x00,0xA0)  /* black, 63% alpha     */
+/* Characters × 16px (8px font × 2× scale) = region width. Must be ×16. */
+#define OSD_CHARS        8   /* "FS:NNNNN" */
+#define OSD_W           (OSD_CHARS * 16)   /* 128 */
+#define OSD_H            16
+#define OSD_HANDLE          5   /* text score OVERLAY_RGN                    */
+#define FACE_BOX_HANDLE_BASE 6  /* OVERLAY_RGN handles 6-9: top/bot/lft/rgt */
+#define FACE_BOX_BORDER_PX  16  /* border thickness — must be multiple of 16 */
+/* RGBA8888 in memory: [R,G,B,A] bytes → uint32 LE = 0xAABBGGRR */
+#define FACE_BOX_RGBA    RGBA(0x00,0xFF,0x00,0xFF)  /* lime green, opaque   */
+
+static volatile int s_osd_ready      = 0;
+static volatile int s_face_box_ready = 0;
+static int          s_fbw            = 0;  /* VENC frame width  (pixels) */
+static int          s_fbh            = 0;  /* VENC frame height (pixels) */
+static int          s_fb_vdev        = 0;
+static int          s_fb_vchn        = 0;
+
+static void osd_draw_char(uint32_t *pixels, int canvas_w,
+                           int x, int y, int idx)
+{
+    const uint8_t *glyph = s_font[idx];
+    for (int row = 0; row < 8; row++) {
+        for (int col = 0; col < 8; col++) {
+            uint32_t color = (glyph[row] & (0x80u >> col)) ? OSD_FG : OSD_BG;
+            int px = x + col * 2;
+            int py = y + row * 2;
+            pixels[ py      * canvas_w + px    ] = color;
+            pixels[ py      * canvas_w + px + 1] = color;
+            pixels[(py + 1) * canvas_w + px    ] = color;
+            pixels[(py + 1) * canvas_w + px + 1] = color;
+        }
+    }
+}
+
+static void osd_update(double score)
+{
+    if (!s_osd_ready) return;
+
+    RGN_CANVAS_INFO_S canvas;
+    memset(&canvas, 0, sizeof(canvas));
+    RK_S32 rc = RK_MPI_RGN_GetCanvasInfo(OSD_HANDLE, &canvas);
+
+    static int s_osd_dbg = 0;
+    if (!s_osd_dbg) { s_osd_dbg = 1;
+        FILE *f = fopen("/tmp/osd_text_dbg", "w");
+        if (f) {
+            fprintf(f, "GetCanvasInfo rc=%d vaddr=%llx virW=%u virH=%u\n",
+                    rc, (unsigned long long)canvas.u64VirAddr,
+                    canvas.u32VirWidth, canvas.u32VirHeight);
+            fclose(f);
+        }
+    }
+    if (rc != RK_SUCCESS) return;
+
+    uint32_t *pixels = (uint32_t *)(uintptr_t)canvas.u64VirAddr;
+    int cw = (int)canvas.u32VirWidth;
+
+    for (int i = 0; i < cw * OSD_H; i++) pixels[i] = OSD_BG;
+
+    char text[OSD_CHARS + 1];
+    snprintf(text, sizeof(text), "FS:%5.0f", score);
+
+    int x = 0;
+    for (int i = 0; i < OSD_CHARS && text[i]; i++, x += 16)
+        osd_draw_char(pixels, cw, x, 0, char_idx(text[i]));
+
+    RK_MPI_RGN_UpdateCanvas(OSD_HANDLE);
+}
+
+/* Draw (or clear) the face bounding box.
+ * Uses 4 thin OVERLAY_RGN strips (top/bottom/left/right edges) — same canvas
+ * API as the working text OSD.  Each strip is Destroy/Create/Fill/Attach on
+ * every call; ~16×512px per strip ≈ 32KB each, no memory pressure.
+ * x0/y0/x1/y1 are in 10000-scale; pass all zeros to clear. */
+static void face_box_draw(int x0_10k, int y0_10k, int x1_10k, int y1_10k)
+{
+    if (!s_face_box_ready) return;
+
+    MPP_CHN_S chn = { RK_ID_VENC, s_fb_vdev, s_fb_vchn };
+    int b = FACE_BOX_BORDER_PX;
+
+    /* Always tear down previous strips first */
+    for (int i = 0; i < 4; i++) {
+        RK_MPI_RGN_DetachFromChn(FACE_BOX_HANDLE_BASE + i, &chn);
+        RK_MPI_RGN_Destroy(FACE_BOX_HANDLE_BASE + i);
+    }
+
+    int show = (x0_10k < x1_10k && y0_10k < y1_10k);
+    if (!show) return;
+
+    int px0 = (x0_10k * s_fbw / 10000) & ~1;
+    int py0 = (y0_10k * s_fbh / 10000) & ~1;
+    int px1 = (x1_10k * s_fbw / 10000) & ~1;
+    int py1 = (y1_10k * s_fbh / 10000) & ~1;
+    if (px0 < 0) px0 = 0; if (px1 > s_fbw - b) px1 = s_fbw - b;
+    if (py0 < 0) py0 = 0; if (py1 > s_fbh - b) py1 = s_fbh - b;
+    if (px1 <= px0 + b*2 || py1 <= py0 + b*2) return;
+
+    /* Canvas width must be multiple of 16; position must be even */
+    int bw = ((px1 - px0 + 15) & ~15);  /* strip width  (top/bottom) */
+    int bh = ((py1 - py0 +  1) & ~1);   /* strip height (left/right) */
+
+    /* Strip geometry: x, y, width, height — indices 0=top 1=bot 2=lft 3=rgt */
+    int sx[4] = { px0,   px0,   px0,   (px1-b)&~1 };
+    int sy[4] = { py0,   (py1-b)&~1, py0, py0 };
+    int sw[4] = { bw,    bw,    b,   b  };
+    int sh[4] = { b,     b,     bh,  bh };
+
+    int rc_all = 0;
+    for (int i = 0; i < 4; i++) {
+        int h = FACE_BOX_HANDLE_BASE + i;
+
+        /* 1. Create region */
+        RGN_ATTR_S attr;
+        memset(&attr, 0, sizeof(attr));
+        attr.enType                             = OVERLAY_RGN;
+        attr.unAttr.stOverlay.enPixelFmt        = RK_FMT_RGBA8888;
+        attr.unAttr.stOverlay.stSize.u32Width   = (uint32_t)sw[i];
+        attr.unAttr.stOverlay.stSize.u32Height  = (uint32_t)sh[i];
+        if (RK_MPI_RGN_Create(h, &attr) != RK_SUCCESS) { rc_all |= -1; continue; }
+
+        /* 2. Attach to channel */
+        RGN_CHN_ATTR_S ca;
+        memset(&ca, 0, sizeof(ca));
+        ca.bShow                                = RK_TRUE;
+        ca.enType                               = OVERLAY_RGN;
+        ca.unChnAttr.stOverlayChn.stPoint.s32X = sx[i];
+        ca.unChnAttr.stOverlayChn.stPoint.s32Y = sy[i];
+        ca.unChnAttr.stOverlayChn.u32BgAlpha   = 0;
+        ca.unChnAttr.stOverlayChn.u32FgAlpha   = 255;
+        ca.unChnAttr.stOverlayChn.u32Layer      = 4;
+        if (RK_MPI_RGN_AttachToChn(h, &chn, &ca) != RK_SUCCESS) {
+            RK_MPI_RGN_Destroy(h); rc_all |= -2; continue;
+        }
+
+        /* 3. Fill canvas solid green */
+        RGN_CANVAS_INFO_S canvas;
+        memset(&canvas, 0, sizeof(canvas));
+        if (RK_MPI_RGN_GetCanvasInfo(h, &canvas) == RK_SUCCESS) {
+            uint32_t *pix = (uint32_t *)(uintptr_t)canvas.u64VirAddr;
+            int n = (int)canvas.u32VirWidth * sh[i];
+            for (int j = 0; j < n; j++) pix[j] = FACE_BOX_RGBA;
+            RK_MPI_RGN_UpdateCanvas(h);
+        } else {
+            rc_all |= -3;
+        }
+    }
+
+    FILE *f = fopen("/tmp/face_box_draw", "w");
+    if (f) {
+        fprintf(f, "OVERLAY strip px=(%d,%d)-(%d,%d) bw=%d bh=%d rc_all=%d\n",
+                px0, py0, px1, py1, bw, bh, rc_all);
+        fclose(f);
+    }
+}
+
+/* Public: called from uvc_process startProcess() after startVenc() */
+void focus_score_osd_attach(int venc_dev, int venc_chn)
+{
+    s_osd_ready      = 0;
+    s_face_box_ready = 0;
+
+    /* ── text score OSD ── */
+    {
+        RGN_ATTR_S attr;
+        memset(&attr, 0, sizeof(attr));
+        attr.enType                               = OVERLAY_RGN;
+        attr.unAttr.stOverlay.enPixelFmt         = RK_FMT_RGBA8888;
+        attr.unAttr.stOverlay.stSize.u32Width    = OSD_W;
+        attr.unAttr.stOverlay.stSize.u32Height   = OSD_H;
+
+        if (RK_MPI_RGN_Create(OSD_HANDLE, &attr) != RK_SUCCESS) {
+            LOG_WARN("focus_score OSD: RGN_Create failed\n");
+            return;
+        }
+
+        MPP_CHN_S chn = { RK_ID_VENC, venc_dev, venc_chn };
+
+        RGN_CHN_ATTR_S ca;
+        memset(&ca, 0, sizeof(ca));
+        ca.bShow                                = RK_TRUE;
+        ca.enType                               = OVERLAY_RGN;
+        ca.unChnAttr.stOverlayChn.stPoint.s32X = 16;
+        ca.unChnAttr.stOverlayChn.stPoint.s32Y = 16;
+        ca.unChnAttr.stOverlayChn.u32BgAlpha   = 0;
+        ca.unChnAttr.stOverlayChn.u32FgAlpha   = 255;
+        ca.unChnAttr.stOverlayChn.u32Layer     = 5;
+
+        if (RK_MPI_RGN_AttachToChn(OSD_HANDLE, &chn, &ca) != RK_SUCCESS) {
+            LOG_WARN("focus_score OSD: AttachToChn VENC(%d,%d) failed\n",
+                     venc_dev, venc_chn);
+            RK_MPI_RGN_Destroy(OSD_HANDLE);
+            return;
+        }
+        s_osd_ready = 1;
+        LOG_INFO("focus_score OSD: text attached to VENC(%d,%d)\n",
+                 venc_dev, venc_chn);
+    }
+
+#if FOCUS_SCORE_FACE_DETECT
+    /* ── face box: 4 thin OVERLAY_RGN strips, created/destroyed per detection ── */
+    {
+        VENC_CHN_ATTR_S venc_attr;
+        memset(&venc_attr, 0, sizeof(venc_attr));
+        if (RK_MPI_VENC_GetChnAttr(venc_chn, &venc_attr) != RK_SUCCESS) {
+            LOG_WARN("focus_score: cannot query VENC size — face box disabled\n");
+            return;
+        }
+        s_fbw     = (int)venc_attr.stVencAttr.u32PicWidth;
+        s_fbh     = (int)venc_attr.stVencAttr.u32PicHeight;
+        s_fb_vdev = venc_dev;
+        s_fb_vchn = venc_chn;
+        s_face_box_ready = 1;
+        LOG_INFO("focus_score: face box OVERLAY strips ready %dx%d\n", s_fbw, s_fbh);
+    }
+#endif /* FOCUS_SCORE_FACE_DETECT */
+}
+
+/* Public: called from uvc_process stopProcess() before VENC is destroyed */
+void focus_score_osd_detach(int venc_dev, int venc_chn)
+{
+    MPP_CHN_S chn = { RK_ID_VENC, venc_dev, venc_chn };
+
+#if FOCUS_SCORE_FACE_DETECT
+    if (s_face_box_ready) {
+        s_face_box_ready = 0;
+        /* Strips may or may not exist depending on last detection — always try */
+        for (int i = 0; i < 4; i++) {
+            RK_MPI_RGN_DetachFromChn(FACE_BOX_HANDLE_BASE + i, &chn);
+            RK_MPI_RGN_Destroy(FACE_BOX_HANDLE_BASE + i);
+        }
+    }
+#endif
+
+    if (s_osd_ready) {
+        s_osd_ready = 0;
+        RK_MPI_RGN_DetachFromChn(OSD_HANDLE, &chn);
+        RK_MPI_RGN_Destroy(OSD_HANDLE);
+    }
+
+    LOG_INFO("focus_score OSD: detached\n");
+}
+
+#endif /* FOCUS_SCORE_OSD */
+
+/* ==========================================================================
+ * Face detection via RKNN (RetinaFace) — compiled out when FOCUS_SCORE_FACE_DETECT == 0
+ * Uses librknnmrt directly instead of RockIVA to avoid model version issues.
+ * ========================================================================== */
+#if FOCUS_SCORE_FACE_DETECT
+
+#define MODEL_PATH      "/oem/usr/share/models/retinaface.rknn"
+#define FACE_DET_EVERY  1    /* run NPU every scoring frame (~500ms interval) */
+#define DET_W           640  /* RetinaFace model input width  */
+#define DET_H           640  /* RetinaFace model input height */
+#define DET_CNT_H       480  /* content height (from 4:3 sensor crop) */
+#define DET_PAD         80   /* letterbox top/bottom = (640-480)/2     */
+#define FACE_THRESH     0.5f /* detection confidence threshold          */
+#define NUM_PRIORS      16800
+
+static rknn_context     s_rknn_ctx     = 0;
+static rknn_tensor_mem *s_input_mem    = NULL;
+static rknn_tensor_mem *s_out_mems[3] = {NULL, NULL, NULL};
+static int32_t          s_out_zp[3]   = {0, 0, 0};
+static float            s_out_sc[3]   = {0.f, 0.f, 0.f};
+static uint8_t         *s_det_buf     = NULL;
+static size_t           s_det_buf_sz  = 0;
+static int              s_det_tick    = 0;
+
+/* Face bounding box in 10000-scale coords — updated each inference run */
+static pthread_mutex_t s_face_mutex = PTHREAD_MUTEX_INITIALIZER;
+static int16_t s_face_x0 = 0, s_face_y0 = 0;
+static int16_t s_face_x1 = 0, s_face_y1 = 0;
+static int     s_face_valid = 0;
+
+static void face_det_init(void)
+{
+    FILE *tr = fopen("/tmp/face_init", "w");
+
+    rknn_context ctx = 0;
+    int ret = rknn_init(&ctx, (char *)MODEL_PATH, 0, 0, NULL);
+    if (tr) fprintf(tr, "rknn_init ret=%d\n", ret);
+    if (ret < 0) {
+        if (tr) { fprintf(tr, "FAILED\n"); fclose(tr); }
+        LOG_WARN("focus_score: rknn_init(%s) failed ret=%d\n", MODEL_PATH, ret);
+        return;
+    }
+
+    rknn_input_output_num io;
+    rknn_query(ctx, RKNN_QUERY_IN_OUT_NUM, &io, sizeof(io));
+    if (tr) fprintf(tr, "inputs=%u outputs=%u\n", io.n_input, io.n_output);
+
+    /* Input: uint8 NHWC BGR (640×640×3) */
+    rknn_tensor_attr ia;
+    memset(&ia, 0, sizeof(ia));
+    ia.index = 0;
+    rknn_query(ctx, RKNN_QUERY_NATIVE_INPUT_ATTR, &ia, sizeof(ia));
+    ia.type = RKNN_TENSOR_UINT8;
+    ia.fmt  = RKNN_TENSOR_NHWC;
+    s_input_mem = rknn_create_mem(ctx, ia.size_with_stride);
+    rknn_set_io_mem(ctx, s_input_mem, &ia);
+    if (tr) fprintf(tr, "input stride_size=%u\n", ia.size_with_stride);
+
+    /* Outputs: location, scores, landmarks */
+    for (int i = 0; i < 3; i++) {
+        rknn_tensor_attr oa;
+        memset(&oa, 0, sizeof(oa));
+        oa.index = i;
+        rknn_query(ctx, RKNN_QUERY_NATIVE_NHWC_OUTPUT_ATTR, &oa, sizeof(oa));
+        s_out_mems[i] = rknn_create_mem(ctx, oa.size_with_stride);
+        rknn_set_io_mem(ctx, s_out_mems[i], &oa);
+        s_out_zp[i] = oa.zp;
+        s_out_sc[i] = oa.scale;
+        if (tr) fprintf(tr, "out[%d] size=%u zp=%d scale=%f\n",
+                        i, oa.size_with_stride, oa.zp, oa.scale);
+    }
+
+    s_rknn_ctx = ctx;
+    if (tr) { fprintf(tr, "OK\n"); fclose(tr); }
+    LOG_WARN("focus_score: RetinaFace RKNN ready\n");
+}
+
+static void face_det_deinit(void)
+{
+    if (!s_rknn_ctx) return;
+    for (int i = 0; i < 3; i++) {
+        if (s_out_mems[i]) { rknn_destroy_mem(s_rknn_ctx, s_out_mems[i]); s_out_mems[i] = NULL; }
+    }
+    if (s_input_mem) { rknn_destroy_mem(s_rknn_ctx, s_input_mem); s_input_mem = NULL; }
+    rknn_destroy(s_rknn_ctx);
+    s_rknn_ctx = 0;
+    free(s_det_buf); s_det_buf = NULL; s_det_buf_sz = 0;
+    pthread_mutex_lock(&s_face_mutex);
+    s_face_valid = 0;
+    pthread_mutex_unlock(&s_face_mutex);
+}
+
+/* Downsample NV12 by an integer power-of-2 scale, removing stride padding. */
+static void downsample_nv12(uint8_t *dst, const uint8_t *src,
+                              int src_w, int src_h, int stride, int scale)
+{
+    int dst_w = src_w / scale;
+    int dst_h = src_h / scale;
+    for (int r = 0; r < dst_h; r++)
+        for (int c = 0; c < dst_w; c++)
+            dst[r * dst_w + c] = src[(r * scale) * stride + (c * scale)];
+    const uint8_t *src_uv = src + (size_t)stride * src_h;
+    uint8_t       *dst_uv = dst + (size_t)dst_w  * dst_h;
+    for (int r = 0; r < dst_h / 2; r++) {
+        const uint8_t *sr = src_uv + (size_t)(r * scale) * stride;
+        uint8_t       *dr = dst_uv + (size_t)r * dst_w;
+        for (int c = 0; c < dst_w / 2; c++) {
+            dr[c * 2 + 0] = sr[c * scale * 2 + 0];
+            dr[c * 2 + 1] = sr[c * scale * 2 + 1];
+        }
+    }
+}
+
+/* Synchronous RetinaFace inference on one VI frame.
+ * Pipeline: downsample → letterbox NV12→BGR 640×640 → rknn_run → parse. */
+static void face_det_run(const uint8_t *nv12, int w, int h, int stride)
+{
+    if (!s_rknn_ctx || !s_input_mem) return;
+
+    /* 1. Downsample to ≤ 1024px wide (power-of-2) — removes stride at same time */
+    int scale = 1;
+    while (w / scale > 1024) scale *= 2;
+    int ds_w = w / scale;  /* e.g. 648 for 2592×1944 at scale=4 */
+    int ds_h = h / scale;
+
+    size_t ds_sz = (size_t)ds_w * ds_h * 3 / 2;
+    if (!s_det_buf || s_det_buf_sz < ds_sz) {
+        free(s_det_buf);
+        s_det_buf = (uint8_t *)malloc(ds_sz);
+        if (!s_det_buf) { s_det_buf_sz = 0; return; }
+        s_det_buf_sz = ds_sz;
+    }
+    downsample_nv12(s_det_buf, nv12, w, h, stride, scale);
+
+    /* 2. Build 640×640 BGR letterboxed image in RKNN input buffer.
+     *    Center-crop ds_w×ds_h → DET_W×DET_CNT_H, pad top/bottom with 114. */
+    int x_off = ((ds_w - DET_W)   / 2) & ~1;  /* even, may be 0 if ds_w < DET_W */
+    int y_off = ((ds_h - DET_CNT_H) / 2) & ~1;
+    if (x_off < 0) x_off = 0;
+    if (y_off < 0) y_off = 0;
+    int cnt_w = ds_w - x_off; if (cnt_w > DET_W)     cnt_w = DET_W;
+    int cnt_h = ds_h - y_off; if (cnt_h > DET_CNT_H) cnt_h = DET_CNT_H;
+
+    const uint8_t *yp = s_det_buf;
+    const uint8_t *up = s_det_buf + (size_t)ds_w * ds_h;
+
+    uint8_t *bgr = (uint8_t *)s_input_mem->virt_addr;
+    memset(bgr, 114, (size_t)DET_W * DET_H * 3);  /* fill letterbox gray */
+
+    for (int r = 0; r < cnt_h; r++) {
+        const uint8_t *yr  = yp + (size_t)(r + y_off)     * ds_w + x_off;
+        const uint8_t *uvr = up + (size_t)(r/2 + y_off/2) * ds_w + x_off;
+        uint8_t       *out = bgr + (size_t)(r + DET_PAD)  * DET_W * 3;
+        for (int c = 0; c < cnt_w; c++) {
+            int Y = (int)yr[c] - 16;
+            int U = (int)uvr[c & ~1] - 128;
+            int V = (int)uvr[c |  1] - 128;
+            int R = (298*Y + 409*V           + 128) >> 8;
+            int G = (298*Y - 100*U - 208*V   + 128) >> 8;
+            int B = (298*Y + 516*U           + 128) >> 8;
+            out[c*3+0] = (uint8_t)(B < 0 ? 0 : B > 255 ? 255 : B);
+            out[c*3+1] = (uint8_t)(G < 0 ? 0 : G > 255 ? 255 : G);
+            out[c*3+2] = (uint8_t)(R < 0 ? 0 : R > 255 ? 255 : R);
+        }
+    }
+
+    /* 3. Run inference (synchronous) */
+    if (rknn_run(s_rknn_ctx, NULL) < 0) {
+        FILE *ef = fopen("/tmp/face_run_err", "w");
+        if (ef) { fprintf(ef, "rknn_run failed\n"); fclose(ef); }
+        return;
+    }
+
+    /* 4. Parse outputs — same logic as retinaface.cc example.
+     *    Locations and scores are int8 quantized; dequantize with zp/scale. */
+    const int8_t *loc    = (const int8_t *)s_out_mems[0]->virt_addr;
+    const int8_t *scores = (const int8_t *)s_out_mems[1]->virt_addr;
+    float loc_sc = s_out_sc[0]; int32_t loc_zp = s_out_zp[0];
+    float sc_sc  = s_out_sc[1]; int32_t sc_zp  = s_out_zp[1];
+
+    static const float VAR[2] = {0.1f, 0.2f};
+
+    int   best_dist = INT_MAX;
+    float bx0 = 0, by0 = 0, bx1 = 0, by1 = 0;
+    int   found = 0;
+
+    for (int i = 0; i < NUM_PRIORS; i++) {
+        float fs = ((float)scores[i*2+1] - sc_zp) * sc_sc;
+        if (fs < FACE_THRESH) continue;
+
+        const int8_t *b = loc + i * 4;
+        float px = ((float)b[0]-loc_zp)*loc_sc * VAR[0]*BOX_PRIORS_640[i][2] + BOX_PRIORS_640[i][0];
+        float py = ((float)b[1]-loc_zp)*loc_sc * VAR[0]*BOX_PRIORS_640[i][3] + BOX_PRIORS_640[i][1];
+        float pw = expf(((float)b[2]-loc_zp)*loc_sc*VAR[1]) * BOX_PRIORS_640[i][2];
+        float ph = expf(((float)b[3]-loc_zp)*loc_sc*VAR[1]) * BOX_PRIORS_640[i][3];
+
+        float x0 = (px - pw*0.5f) * DET_W;
+        float y0 = (py - ph*0.5f) * DET_H;
+        float x1 = (px + pw*0.5f) * DET_W;
+        float y1 = (py + ph*0.5f) * DET_H;
+
+        /* center in original-frame 10k-scale for distance-to-center selection */
+        float cx10k = ((x0+x1)*0.5f + x_off) * scale * 10000.0f / w;
+        float cy10k = ((y0+y1)*0.5f - DET_PAD + y_off) * scale * 10000.0f / h;
+        int dx = (int)cx10k - 5000, dy = (int)cy10k - 5000;
+        int dist = dx*dx + dy*dy;
+
+        if (dist < best_dist) {
+            best_dist = dist;
+            bx0 = x0; by0 = y0; bx1 = x1; by1 = y1;
+            found = 1;
+        }
+    }
+
+    /* 5. Map best face box from model 640×640 space → 10000-scale in original frame */
+    int16_t fx0 = 0, fy0 = 0, fx1 = 0, fy1 = 0;
+    int valid = 0;
+
+    if (found) {
+        float y0c = by0 - DET_PAD; if (y0c < 0)        y0c = 0;
+        float y1c = by1 - DET_PAD; if (y1c > DET_CNT_H) y1c = DET_CNT_H;
+        if (bx0 < 0) bx0 = 0;     if (bx1 > DET_W)     bx1 = DET_W;
+
+        fx0 = (int16_t)((bx0 + x_off) * scale * 10000 / w);
+        fy0 = (int16_t)((y0c + y_off) * scale * 10000 / h);
+        fx1 = (int16_t)((bx1 + x_off) * scale * 10000 / w);
+        fy1 = (int16_t)((y1c + y_off) * scale * 10000 / h);
+        if (fx0 >= 0 && fy0 >= 0 && fx1 > fx0 && fy1 > fy0) valid = 1;
+    }
+
+    FILE *dbg = fopen("/tmp/face_detect", "w");
+    if (dbg) {
+        fprintf(dbg, "found=%d valid=%s box10k=(%d,%d)-(%d,%d)\n",
+                found, valid ? "YES" : "NO", fx0, fy0, fx1, fy1);
+        fclose(dbg);
+    }
+
+    pthread_mutex_lock(&s_face_mutex);
+    s_face_x0 = fx0; s_face_y0 = fy0;
+    s_face_x1 = fx1; s_face_y1 = fy1;
+    s_face_valid = valid;
+    pthread_mutex_unlock(&s_face_mutex);
+
+#if FOCUS_SCORE_OSD
+    face_box_draw(valid ? fx0 : 0, valid ? fy0 : 0,
+                  valid ? fx1 : 0, valid ? fy1 : 0);
+#endif
+}
+
+/* Return the crop rect to score — face bbox with padding, or center crop. */
+static void get_crop(int w, int h, int *cx, int *cy, int *cw, int *ch)
+{
+    pthread_mutex_lock(&s_face_mutex);
+    int valid = s_face_valid;
+    int fx0   = s_face_x0, fy0 = s_face_y0;
+    int fx1   = s_face_x1, fy1 = s_face_y1;
+    pthread_mutex_unlock(&s_face_mutex);
+
+    if (valid) {
+        int px0 = fx0 * w / 10000;
+        int py0 = fy0 * h / 10000;
+        int px1 = fx1 * w / 10000;
+        int py1 = fy1 * h / 10000;
+        /* 50% padding around the face for natural focus response */
+        int pad_x = (px1 - px0) / 2;
+        int pad_y = (py1 - py0) / 2;
+        *cx = px0 - pad_x; if (*cx < 0) *cx = 0;
+        *cy = py0 - pad_y; if (*cy < 0) *cy = 0;
+        *cw = (px1 + pad_x) - *cx; if (*cx + *cw > w) *cw = w - *cx;
+        *ch = (py1 + pad_y) - *cy; if (*cy + *ch > h) *ch = h - *cy;
+    } else {
+        *cw = (w < SCORE_CROP_W) ? w : SCORE_CROP_W;
+        *ch = (h < SCORE_CROP_H) ? h : SCORE_CROP_H;
+        *cx = (w - *cw) / 2;
+        *cy = (h - *ch) / 2;
+    }
+}
+
+#else  /* !FOCUS_SCORE_FACE_DETECT — use static center crop */
+
+static void get_crop(int w, int h, int *cx, int *cy, int *cw, int *ch)
+{
+    *cw = (w < SCORE_CROP_W) ? w : SCORE_CROP_W;
+    *ch = (h < SCORE_CROP_H) ? h : SCORE_CROP_H;
+    *cx = (w - *cw) / 2;
+    *cy = (h - *ch) / 2;
+}
+
+#endif /* FOCUS_SCORE_FACE_DETECT */
+
+/* ==========================================================================
+ * Focus scoring thread
+ * ========================================================================== */
+static void *focus_thread(void *arg)
+{
+    (void)arg;
+
+#if FOCUS_SCORE_FACE_DETECT
+    face_det_init();
+#endif
+
+    while (!s_quit && !uvc_vi_is_isp_running())
+        usleep(100000);
+
+    LOG_INFO("focus_score: VI running — scoring started (pipe=%d chn=%d)\n",
+             s_pipe_id, s_chn_id);
+
+    uint32_t frame_counter = 0;
+
+    while (!s_quit) {
+        VIDEO_FRAME_INFO_S frame;
+        memset(&frame, 0, sizeof(frame));
+
+        int ret = RK_MPI_VI_GetChnFrame(s_pipe_id, s_chn_id,
+                                         &frame, GETFRAME_TIMEOUT);
+        if (ret != RK_SUCCESS) {
+            usleep(SCORE_INTERVAL_US);
+            continue;
+        }
+
+        int w      = (int)frame.stVFrame.u32Width;
+        int h      = (int)frame.stVFrame.u32Height;
+        int stride = (int)frame.stVFrame.u32VirWidth;
+        if (stride <= 0) stride = w;
+
+        if (w > 0 && h > 0 && frame.stVFrame.pMbBlk) {
+            RK_MPI_SYS_MmzFlushCache(frame.stVFrame.pMbBlk, RK_TRUE);
+            const uint8_t *y_plane =
+                (const uint8_t *)RK_MPI_MB_Handle2VirAddr(frame.stVFrame.pMbBlk);
+
+            if (y_plane) {
+#if FOCUS_SCORE_FACE_DETECT
+                if (++s_det_tick >= FACE_DET_EVERY) {
+                    s_det_tick = 0;
+                    face_det_run(y_plane, w, h, stride);
+                }
+#endif
+                int cx, cy, cw, ch;
+                get_crop(w, h, &cx, &cy, &cw, &ch);
+
+                double score = tenengrad_score(y_plane, stride, cx, cy, cw, ch);
+                s_score = score;
+
+                FILE *f = fopen(FOCUS_SCORE_PATH, "w");
+                if (f) { fprintf(f, "%.1f\n", score); fclose(f); }
+
+                LOG_INFO("focus_score: %.1f  (%dx%d crop=%dx%d@%d,%d)\n",
+                         score, w, h, cw, ch, cx, cy);
+
+#if FOCUS_SCORE_OSD
+                osd_update(score);
+#endif
+            }
+        }
+
+        RK_MPI_VI_ReleaseChnFrame(s_pipe_id, s_chn_id, &frame);
+        frame_counter++;
+        usleep(SCORE_INTERVAL_US);
+    }
+
+#if FOCUS_SCORE_FACE_DETECT
+    face_det_deinit();
+#endif
+
+    remove(FOCUS_SCORE_PATH);
+    LOG_INFO("focus_score: thread exited\n");
+    return NULL;
+}
+
+void focus_score_start(int pipe_id, int chn_id)
+{
+    s_pipe_id = pipe_id;
+    s_chn_id  = chn_id;
+    s_quit    = 0;
+    s_score   = 0.0;
+#if FOCUS_SCORE_OSD
+    s_osd_ready      = 0;
+    s_face_box_ready = 0;
+#endif
+    pthread_create(&s_tid, NULL, focus_thread, NULL);
+    LOG_INFO("focus_score: thread created (pipe=%d chn=%d)\n", pipe_id, chn_id);
+}
+
+void focus_score_stop(void)
+{
+    s_quit = 1;
+#if FOCUS_SCORE_OSD
+    s_osd_ready      = 0;
+    s_face_box_ready = 0;
+#endif
+    pthread_join(s_tid, NULL);
+}
+
+double focus_score_get(void)
+{
+    return s_score;
+}

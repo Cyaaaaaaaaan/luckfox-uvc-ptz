@@ -794,6 +794,187 @@ fi
 
 ok "Patch 6 complete: $CFG_FILE"
 
+# ═════════════════════════════════════════════════════════════════════════════
+# PATCH 7 — RKNN RetinaFace face detection + focus scoring OSD
+#
+#   Adds direct RKNN inference (librknnmrt) for face detection using the
+#   retinaface.rknn model.  Detected face region drives the Tenengrad focus
+#   sharpness scorer and is shown as a green bounding box via four thin
+#   OVERLAY_RGN strips (full-frame overlay and COVER_RGN are non-functional
+#   at 2592×1944 on this SDK).
+#
+#   Requires: /oem/usr/share/models/retinaface.rknn on the target device.
+#   Model source: luckfox_pico_rkmpi_example retinaface example.
+# ═════════════════════════════════════════════════════════════════════════════
+SCRIPT_DIR_ABS="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+FILES_UVC="$SCRIPT_DIR_ABS/files/uvc"
+CMAKE_FILE="$UVC_SRC/CMakeLists.txt"
+MAIN_FILE="$UVC_SRC/main.c"
+PROC_FILE7="$UVC_SRC/uvc/uvc_process.cpp"
+
+info "Patch 7: RKNN face detection + focus scoring OSD"
+
+# 7a. Copy new source files
+for f in focus_score.cpp focus_score.h rknn_api.h rknn_box_priors.h; do
+    if [[ -f "$UVC_SRC/uvc/$f" ]] && grep -q "RKNN\|face_det\|BOX_PRIORS" "$UVC_SRC/uvc/$f" 2>/dev/null; then
+        skip "  7a: $f already present"
+    else
+        cp "$FILES_UVC/$f" "$UVC_SRC/uvc/$f"
+        ok "  7a: copied $f"
+    fi
+done
+
+# 7b. CMakeLists.txt — add focus_score.cpp to source list
+if grep -q "focus_score.cpp" "$CMAKE_FILE"; then
+    skip "  7b: focus_score.cpp already in CMakeLists.txt"
+else
+    replace_in_file "$CMAKE_FILE" \
+'    uvc/osd.c
+    isp/isp.c' \
+'    uvc/osd.c
+    uvc/focus_score.cpp
+    isp/isp.c' \
+    && ok "  7b: focus_score.cpp added to CMakeLists.txt" \
+    || error "  7b: could not add focus_score.cpp to CMakeLists.txt"
+fi
+
+# 7c. CMakeLists.txt — add rknnmrt to fastboot dep libs
+if grep -q "rknnmrt" "$CMAKE_FILE"; then
+    skip "  7c: rknnmrt already in CMakeLists.txt"
+else
+    replace_in_file "$CMAKE_FILE" \
+'    pthread
+    rt
+    rkaiq
+    librockit.a' \
+'    pthread
+    rt
+    rkaiq
+    rknnmrt
+    librockit.a' \
+    && ok "  7c: rknnmrt added to fastboot libs" \
+    || error "  7c: could not add rknnmrt to fastboot libs"
+
+    replace_in_file "$CMAKE_FILE" \
+'        pthread
+        rt
+        rkaiq
+        rockit' \
+'        pthread
+        rt
+        rkaiq
+        rknnmrt
+        rockit' \
+    && ok "  7c: rknnmrt added to non-fastboot libs" \
+    || error "  7c: could not add rknnmrt to non-fastboot libs"
+fi
+
+# 7d. main.c — add focus_score.h include
+if grep -q "focus_score.h" "$MAIN_FILE"; then
+    skip "  7d: focus_score.h include already in main.c"
+else
+    replace_in_file "$MAIN_FILE" \
+'#include "camera_control.h"
+#include "isp.h"' \
+'#include "camera_control.h"
+#include "focus_score.h"
+#include "isp.h"' \
+    && ok "  7d: focus_score.h include added to main.c" \
+    || error "  7d: could not add focus_score.h include to main.c"
+fi
+
+# 7e. main.c — add focus_score_start after uvc_control_run
+if grep -q "focus_score_start" "$MAIN_FILE"; then
+    skip "  7e: focus_score_start already in main.c"
+else
+    replace_in_file "$MAIN_FILE" \
+'  uvc_control_run(UVC_CONTROL_CAMERA);
+
+#ifdef COMPILE_FOR_UVC_UAC' \
+'  uvc_control_run(UVC_CONTROL_CAMERA);
+  focus_score_start(0, 0); /* pipe=0, chn=0 — matches VI UVC channel default */
+
+#ifdef COMPILE_FOR_UVC_UAC' \
+    && ok "  7e: focus_score_start added to main.c" \
+    || error "  7e: could not add focus_score_start to main.c"
+fi
+
+# 7f. main.c — add focus_score_stop before uvc_video_id_exit_all
+if grep -q "focus_score_stop" "$MAIN_FILE"; then
+    skip "  7f: focus_score_stop already in main.c"
+else
+    replace_in_file "$MAIN_FILE" \
+'  uvc_video_id_exit_all();
+  camera_control_deinit();' \
+'  focus_score_stop();
+  uvc_video_id_exit_all();
+  camera_control_deinit();' \
+    && ok "  7f: focus_score_stop added to main.c" \
+    || error "  7f: could not add focus_score_stop to main.c"
+fi
+
+# 7g. uvc_process.cpp — add focus_score.h include
+if grep -q "focus_score.h" "$PROC_FILE7"; then
+    skip "  7g: focus_score.h already included in uvc_process.cpp"
+else
+    replace_in_file "$PROC_FILE7" \
+'#include "uvc_process.h"
+#include "osd.h"' \
+'#include "uvc_process.h"
+#include "focus_score.h"
+#include "osd.h"' \
+    && ok "  7g: focus_score.h added to uvc_process.cpp" \
+    || error "  7g: could not add focus_score.h to uvc_process.cpp"
+fi
+
+# 7h. uvc_process.cpp — focus_score_osd_attach after osd_start in startProcess()
+if grep -q "focus_score_osd_attach" "$PROC_FILE7"; then
+    skip "  7h: focus_score_osd_attach already in uvc_process.cpp"
+else
+    replace_in_file "$PROC_FILE7" \
+'  if (ctx->mUvcCfg.osd_cfg.enable)
+    osd_start(&ctx->mUvcCfg);
+
+  return 0;
+}' \
+'  if (ctx->mUvcCfg.osd_cfg.enable)
+    osd_start(&ctx->mUvcCfg);
+
+#if FOCUS_SCORE_OSD
+  focus_score_osd_attach(0, ctx->mUvcCfg.venc_cfg.common_cfg.channel_id);
+#endif
+
+  return 0;
+}' \
+    && ok "  7h: focus_score_osd_attach added to startProcess()" \
+    || error "  7h: could not add focus_score_osd_attach to uvc_process.cpp"
+fi
+
+# 7i. uvc_process.cpp — focus_score_osd_detach before osd_stop in stopProcess()
+if grep -q "focus_score_osd_detach" "$PROC_FILE7"; then
+    skip "  7i: focus_score_osd_detach already in uvc_process.cpp"
+else
+    replace_in_file "$PROC_FILE7" \
+'    ctx->mThread = nullptr;
+  }
+
+  if (ctx->mUvcCfg.osd_cfg.enable)
+    osd_stop(&ctx->mUvcCfg);' \
+'    ctx->mThread = nullptr;
+  }
+
+#if FOCUS_SCORE_OSD
+  focus_score_osd_detach(0, ctx->mUvcCfg.venc_cfg.common_cfg.channel_id);
+#endif
+
+  if (ctx->mUvcCfg.osd_cfg.enable)
+    osd_stop(&ctx->mUvcCfg);' \
+    && ok "  7i: focus_score_osd_detach added to stopProcess()" \
+    || error "  7i: could not add focus_score_osd_detach to uvc_process.cpp"
+fi
+
+ok "Patch 7 complete: RKNN face detection + OSD"
+
 echo ""
 ok "══════════════════════════════════════════"
 ok " All patches applied successfully!"
