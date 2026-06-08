@@ -976,6 +976,77 @@ fi
 
 ok "Patch 7 complete: RKNN face detection + OSD"
 
+# ═════════════════════════════════════════════════════════════════════════════
+# PATCH 8 — ISP IPC server (rk_mpi_uvc receives commands from visca_server)
+#   8a. Copy isp_ipc.h / isp_ipc.cpp into UVC source tree
+#   8b. Add isp_ipc.cpp to uvc_app CMakeLists.txt
+#   8c. Wire isp_ipc_start() / isp_ipc_stop() into main.cpp
+# ═════════════════════════════════════════════════════════════════════════════
+REPO_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+UVC_ISP_DIR="$UVC_SRC/isp"
+CC_FILE8="$UVC_SRC/uvc/camera_control.c"
+CMAKE_FILE8="$UVC_SRC/CMakeLists.txt"
+
+info "Patch 8: ISP IPC server (AE/WB control from visca_server)"
+
+# 8a. Copy isp_ipc files (header into isp/, cpp at top level alongside other sources)
+if [[ -f "$UVC_ISP_DIR/isp_ipc.h" ]]; then
+    skip "  8a: isp_ipc.h already in UVC source"
+else
+    cp "$REPO_DIR/files/uvc/isp_ipc.h"   "$UVC_ISP_DIR/isp_ipc.h"
+    ok "  8a: isp_ipc.h copied to $UVC_ISP_DIR"
+fi
+if [[ -f "$UVC_SRC/uvc/isp_ipc.cpp" ]]; then
+    skip "  8a: isp_ipc.cpp already in UVC source"
+else
+    cp "$REPO_DIR/files/uvc/isp_ipc.cpp" "$UVC_SRC/uvc/isp_ipc.cpp"
+    ok "  8a: isp_ipc.cpp copied to $UVC_SRC/uvc"
+fi
+
+# 8b. CMakeLists.txt — add isp_ipc.cpp alongside focus_score.cpp
+if grep -q "isp_ipc.cpp" "$CMAKE_FILE8"; then
+    skip "  8b: isp_ipc.cpp already in CMakeLists.txt"
+else
+    replace_in_file "$CMAKE_FILE8" \
+'uvc/focus_score.cpp' \
+'uvc/focus_score.cpp
+    uvc/isp_ipc.cpp' \
+    && ok "  8b: isp_ipc.cpp added to CMakeLists.txt" \
+    || error "  8b: could not add isp_ipc.cpp — check CMakeLists.txt manually"
+fi
+
+# 8c. camera_control.c — include header
+if grep -q "isp_ipc.h" "$CC_FILE8"; then
+    skip "  8c: isp_ipc already wired in camera_control.c"
+else
+    replace_in_file "$CC_FILE8" \
+'#include "isp.h"' \
+'#include "isp.h"
+#include "isp_ipc.h"' \
+    && ok "  8c: isp_ipc.h included in camera_control.c" \
+    || error "  8c: could not include isp_ipc.h — check camera_control.c manually"
+
+    # Wire isp_ipc_start after the first rk_isp_init call in camera_control_init()
+    replace_in_file "$CC_FILE8" \
+'    rk_isp_init(0, rkuvc_iq_file_path_);
+    rk_isp_set_frame_rate(0, rk_param_get_int("isp.0.adjustment:fps", 30));' \
+'    rk_isp_init(0, rkuvc_iq_file_path_);
+    isp_ipc_start(0);
+    rk_isp_set_frame_rate(0, rk_param_get_int("isp.0.adjustment:fps", 30));' \
+    && ok "  8c: isp_ipc_start() wired in camera_control_init()" \
+    || error "  8c: could not wire isp_ipc_start() — check camera_control.c manually"
+
+    # Wire isp_ipc_stop before rk_isp_deinit in camera_control_deinit()
+    replace_in_file "$CC_FILE8" \
+'    rk_isp_deinit(0);' \
+'    isp_ipc_stop();
+    rk_isp_deinit(0);' \
+    && ok "  8c: isp_ipc_stop() wired in camera_control_deinit()" \
+    || error "  8c: could not wire isp_ipc_stop() — check camera_control.c manually"
+fi
+
+ok "Patch 8 complete: ISP IPC server"
+
 echo ""
 ok "══════════════════════════════════════════"
 ok " All patches applied successfully!"

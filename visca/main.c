@@ -8,6 +8,7 @@
 #include <arpa/inet.h>
 #include "visca.h"
 #include "motor.h"
+#include "isp_ctrl.h"
 
 #define VISCA_PORT 1259
 
@@ -23,6 +24,7 @@ int main(void) {
     signal(SIGTERM, on_signal);
 
     motor_init();
+    isp_ctrl_init();
 
     int sock = socket(AF_INET, SOCK_DGRAM, 0);
     if (sock < 0) { perror("socket"); return 1; }
@@ -55,6 +57,7 @@ int main(void) {
     }
 
     printf("[visca] shutting down\n");
+    isp_ctrl_deinit();
     motor_deinit();
     close(sock);
     return 0;

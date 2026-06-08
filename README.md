@@ -17,15 +17,17 @@ Fixes resolution switching, removes YUYV, enforces 4:3-only resolutions, sets up
 ## Repository layout
 
 ```
-apply_patches.sh       — idempotent SDK patcher (patches 1–7)
+apply_patches.sh       — idempotent SDK patcher (patches 1–8)
 build-app.sh           — build rk_mpi_uvc + visca_server, print deploy commands
 RkLunch.sh             — boot launcher (replaces factory rkipc launcher)
 files/
-  uvc/                 — new source files injected by Patch 7
+  uvc/                 — new source files injected by patches 7–8
     focus_score.cpp    — RKNN face detection + Tenengrad focus scorer
     focus_score.h
     rknn_api.h
     rknn_box_priors.h  — RetinaFace 640×640 prior anchors
+    isp_ipc.cpp        — Unix socket IPC server (receives AE/WB cmds from visca_server)
+    isp_ipc.h
   models/
     retinaface.rknn    — bundled RetinaFace model (637 KB)
 patches/               — reference diffs for patches 1–5
@@ -33,6 +35,7 @@ visca/                 — VISCA-over-IP PTZ server
   main.c               — UDP socket, signal handling
   visca.c              — KC2000 packet parser + dispatcher
   motor.c/h            — motor control layer (stub — replace with real GPIO/UART)
+  isp_ctrl.c/h         — Unix socket IPC client (sends AE/WB cmds to rk_mpi_uvc)
   CMakeLists.txt
 ```
 
@@ -49,6 +52,7 @@ Patches are applied by `apply_patches.sh` (idempotent — safe to re-run).
 | 5 | `isp.c` | Silences spurious insmod/mkdir/udev stderr noise |
 | 6 | `uvc_mpi_config.c` | Sets native 2592×1944 max size, disables VPSS (incompatible on RV1106 at full res) |
 | 7 | `focus_score.cpp` + wiring | RKNN RetinaFace face detection, Tenengrad focus scoring, green OSD bounding box |
+| 8 | `isp_ipc.cpp` + wiring | Unix socket IPC server — receives AE/WB commands from `visca_server` and applies them via rkaiq |
 
 **Key VI fix:** `RK_MPI_VI_DisableChn` on RV1106 triggers a full ISP restart → AIQ detects SOF disorder (frame counter reset) → VI permanently stops delivering frames. These patches replace DisableChn with in-place `RK_MPI_VI_SetChnAttr`, requiring `stIspOpt.stMaxSize` to be set to the sensor native max (2592×1944).
 
@@ -81,10 +85,35 @@ Always-on face detection using the RKNN NPU:
 | Zoom stop | `81 01 04 07 00 FF` | stop zoom |
 | Focus near/far | `81 01 04 08 pp FF` | `motor_focus(dir, speed)` |
 | Focus mode | `81 01 04 38 03 FF` | ACK only |
+| AE mode | `81 01 04 39 pp FF` | 00=auto, 03/0A/0B=manual → ISP exposure mode |
+| WB mode | `81 01 04 35 pp FF` | 00=auto, 01=indoor(3200K), 02=outdoor(5800K), 05=manual → ISP WB |
+| OSD menu | `81 01 06 06 pp FF` | ACK only (no OSD implemented) |
+| Memory recall | `81 01 04 3F 02 pp FF` | ACK only |
 
 Responses: `90 41 FF` (ACK) + `90 51 FF` (completion) per command.
+Inquiries (`81 09 ...`): shadow state is maintained for AE/WB mode and returned as `90 50 [data] FF`.
 
 The motor layer (`visca/motor.c`) is currently stubbed — it prints commands to stdout. Replace the function bodies with real TMC2209 UART and DRV8833 PWM calls when hardware is connected.
+
+### AE/WB IPC architecture
+
+`visca_server` and `rk_mpi_uvc` are separate processes. rkaiq (the ISP library) is a singleton that must be owned by one process — `rk_mpi_uvc` owns it. When the PTZ controller sends an exposure or white-balance command, `visca_server` forwards it as a text datagram over a Unix socket (`/tmp/visca_isp.sock`):
+
+```
+KC2000 ──UDP:1259──▶ visca_server ──Unix DGRAM──▶ rk_mpi_uvc
+                        (client)    /tmp/visca_isp.sock  (server → rkaiq)
+```
+
+Text command protocol (one per datagram):
+```
+ae auto          — full auto exposure
+ae manual        — manual exposure
+wb auto          — auto white balance
+wb indoor        — manual WB, 3200 K
+wb outdoor       — manual WB, 5800 K
+wb manual        — manual WB (current CT unchanged)
+wb ct <kelvin>   — manual WB, specific colour temperature (2000–10000)
+```
 
 ### Testing without hardware
 

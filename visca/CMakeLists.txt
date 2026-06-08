@@ -5,6 +5,7 @@ add_executable(visca_server
     main.c
     visca.c
     motor.c
+    isp_ctrl.c
 )
 
 target_compile_options(visca_server PRIVATE -Wall -Wextra)
