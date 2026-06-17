@@ -59,15 +59,29 @@ Patches are applied by `apply_patches.sh` (idempotent — safe to re-run).
 
 **Supported resolutions:** 640×480 · 1024×768 · 1280×960 · 2048×1536 · 2592×1944
 
-## Face detection (Patch 7)
+## Face detection & focus scoring (Patches 7 & 9)
 
-Always-on face detection using the RKNN NPU:
+Always-on face detection using the RKNN NPU, feeding a hardware-computed focus score:
 
 - **Model:** RetinaFace (640×640 BGR, 16800 prior anchors) — loaded from `/oem/usr/share/models/retinaface.rknn`
 - **Pipeline:** NV12 frame → 4× integer downsample → 640×640 letterbox BGR → RKNN inference → decode anchors → select most-centred face above 0.5 confidence
-- **Focus scoring:** The Tenengrad sharpness score crops around the detected face (with 50% padding). Falls back to a fixed 320×240 centre crop when no face is present.
+- **Focus scoring (Patch 9):** Uses the **hardware ISP sharpness statistic** via `rk_aiq_user_api2_af_GetSearchPath()` — zero CPU cost, updated every frame. After each detection the ISP AF measurement window (`h_offs/v_offs/h_size/v_size`) is set to the face bbox via `rk_aiq_user_api2_af_SetAttrib()`, so the score reflects only the face region. With no face the window resets to full frame. Falls back to a CPU Tenengrad crop only if the rkaiq context is unavailable.
+  - Typical range: **1–10** fully blurred, **90–150+** sharp on a face — a clean monotonic peak for hill-climbing autofocus.
+  - Without the face-aware window, busy backgrounds (e.g. patterned bedsheets) scored 400+ regardless of subject focus; the windowed approach fixes this.
 - **OSD green box:** Drawn as four thin OVERLAY_RGN strips (one per edge). Full-frame overlay and COVER_RGN are non-functional at 2592×1944 on this SDK — per-edge strips work reliably.
 - **Detection rate:** Runs every scoring frame (~500 ms update)
+
+### Display modes (debug overlays)
+
+The score OSD and green face box are **off by default** (mode 0) — production streams are clean. Three verbosity levels, cycled by the KC2000 menu button or set via IPC:
+
+| Mode | Face box | Score OSD |
+|------|----------|-----------|
+| 0 (default) | off | off |
+| 1 | on | off |
+| 2 | on | on |
+
+The score is always written to `/tmp/focus_score` regardless of display mode (`watch -n0.5 cat /tmp/focus_score`).
 
 ## VISCA-over-IP PTZ control
 
@@ -88,7 +102,7 @@ Always-on face detection using the RKNN NPU:
 | Focus mode | `81 01 04 38 03 FF` | ACK only |
 | AE mode | `81 01 04 39 pp FF` | 00=auto, 03/0A/0B=manual → ISP exposure mode |
 | WB mode | `81 01 04 35 pp FF` | 00=auto, 01=indoor(3200K), 02=outdoor(5800K), 05=manual → ISP WB |
-| OSD menu | `81 01 06 06 pp FF` | ACK only (no OSD implemented) |
+| CAM menu button | `81 01 06 06 pp FF` | cycles debug display mode 0→1→2→0 (sends `display N` over IPC) |
 | Memory recall | `81 01 04 3F 02 pp FF` | ACK only |
 
 Responses: `90 41 FF` (ACK) + `90 51 FF` (completion) per command.
@@ -114,6 +128,14 @@ wb indoor        — manual WB, 3200 K
 wb outdoor       — manual WB, 5800 K
 wb manual        — manual WB (current CT unchanged)
 wb ct <kelvin>   — manual WB, specific colour temperature (2000–10000)
+display <0|1|2>  — debug overlay verbosity (0=off, 1=box, 2=box+score)
+osd on / osd off — toggle the score OSD (on implies box)
+facebox on/off   — toggle the green face box (off clears score too)
+```
+
+These IPC commands can also be sent directly from the board for testing:
+```sh
+python3 -c "import socket; s=socket.socket(socket.AF_UNIX,socket.SOCK_DGRAM); s.connect('/tmp/visca_isp.sock'); s.send(b'display 2')"
 ```
 
 ### Testing without hardware

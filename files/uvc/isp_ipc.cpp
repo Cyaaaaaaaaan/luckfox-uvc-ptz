@@ -8,6 +8,7 @@
 
 extern "C" {
 #include "isp.h"
+#include "focus_score.h"
 }
 #include "isp_ipc.h"
 
@@ -44,6 +45,23 @@ static void apply_cmd(const char *cmd) {
             /* "auto" or anything else */
             rk_isp_set_white_blance_style(s_cam_id, "auto");
         }
+    } else if (strncmp(cmd, "display ", 8) == 0) {
+        /* Verbosity level: 0=off, 1=box, 2=box+score */
+        focus_score_set_display_mode(atoi(cmd + 8));
+    } else if (strcmp(cmd, "osd on") == 0) {
+        /* score implies box → full verbosity */
+        focus_score_set_display_mode(2);
+    } else if (strcmp(cmd, "osd off") == 0) {
+        /* drop score but keep box if it was on, else stay off */
+        int mode = focus_score_get_display_mode();
+        focus_score_set_display_mode(mode >= 1 ? 1 : 0);
+    } else if (strcmp(cmd, "facebox on") == 0) {
+        /* enable box, preserve score if already on */
+        int mode = focus_score_get_display_mode();
+        focus_score_set_display_mode(mode >= 1 ? mode : 1);
+    } else if (strcmp(cmd, "facebox off") == 0) {
+        /* box off turns off everything (score requires box) */
+        focus_score_set_display_mode(0);
     } else {
         printf("[isp_ipc] unknown cmd: %s\n", cmd);
     }

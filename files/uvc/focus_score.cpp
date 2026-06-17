@@ -111,6 +111,8 @@ static int char_idx(char c) {
 
 static volatile int s_osd_ready      = 0;
 static volatile int s_face_box_ready = 0;
+static volatile int s_osd_visible      = 0;  /* off by default, toggle with menu btn */
+static volatile int s_facebox_visible  = 0;
 static int          s_fbw            = 0;  /* VENC frame width  (pixels) */
 static int          s_fbh            = 0;  /* VENC frame height (pixels) */
 static int          s_fb_vdev        = 0;
@@ -136,6 +138,7 @@ static void osd_draw_char(uint32_t *pixels, int canvas_w,
 static void osd_update(double score)
 {
     if (!s_osd_ready) return;
+    if (!s_osd_visible) return;
 
     RGN_CANVAS_INFO_S canvas;
     memset(&canvas, 0, sizeof(canvas));
@@ -176,6 +179,10 @@ static void osd_update(double score)
 static void face_box_draw(int x0_10k, int y0_10k, int x1_10k, int y1_10k)
 {
     if (!s_face_box_ready) return;
+    if (!s_facebox_visible) {
+        /* clear any existing box */
+        x0_10k = x1_10k = y0_10k = y1_10k = 0;
+    }
 
     MPP_CHN_S chn = { RK_ID_VENC, s_fb_vdev, s_fb_vchn };
     int b = FACE_BOX_BORDER_PX;
@@ -343,6 +350,42 @@ void focus_score_osd_detach(int venc_dev, int venc_chn)
 }
 
 #endif /* FOCUS_SCORE_OSD */
+
+/* Display mode cycling (called from IPC or VISCA menu button):
+ * Mode 0: both OFF (default)
+ * Mode 1: face box ON, OSD OFF
+ * Mode 2: both ON (debug)
+ * Defined unconditionally so isp_ipc.cpp links regardless of FOCUS_SCORE_OSD. */
+static int s_display_mode = 0;
+
+void focus_score_set_display_mode(int mode)
+{
+    s_display_mode = ((mode % 3) + 3) % 3;  /* clamp 0..2, handle negatives */
+#if FOCUS_SCORE_OSD
+    s_osd_visible     = (s_display_mode == 2) ? 1 : 0;
+    s_facebox_visible = (s_display_mode >= 1) ? 1 : 0;
+    /* clear face box immediately if hiding */
+    if (!s_facebox_visible)
+        face_box_draw(0, 0, 0, 0);
+    /* clear OSD text immediately if hiding */
+    if (!s_osd_visible && s_osd_ready) {
+        RGN_CANVAS_INFO_S canvas;
+        memset(&canvas, 0, sizeof(canvas));
+        if (RK_MPI_RGN_GetCanvasInfo(OSD_HANDLE, &canvas) == RK_SUCCESS) {
+            memset((void *)(uintptr_t)canvas.u64VirAddr, 0,
+                   canvas.u32VirWidth * OSD_H * 4);
+            RK_MPI_RGN_UpdateCanvas(OSD_HANDLE);
+        }
+    }
+    LOG_INFO("focus_score: display mode %d (osd=%d facebox=%d)\n",
+             s_display_mode, s_osd_visible, s_facebox_visible);
+#endif
+}
+
+int focus_score_get_display_mode(void)
+{
+    return s_display_mode;
+}
 
 /* ==========================================================================
  * Face detection via RKNN (RetinaFace) — compiled out when FOCUS_SCORE_FACE_DETECT == 0

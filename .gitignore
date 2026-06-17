@@ -1,0 +1,8 @@
+# Build output
+visca/build/
+*.o
+*.a
+
+# Editor / OS cruft
+*.swp
+.DS_Store

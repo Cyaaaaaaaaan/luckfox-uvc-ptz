@@ -816,10 +816,11 @@ PROC_FILE7="$UVC_SRC/uvc/uvc_process.cpp"
 info "Patch 7: RKNN face detection + focus scoring OSD"
 
 # 7a. Copy new source files
-# focus_score.cpp is always overwritten so ISP sharpness changes propagate
+# focus_score.cpp/.h are always overwritten so changes propagate
 cp "$FILES_UVC/focus_score.cpp" "$UVC_SRC/uvc/focus_score.cpp"
-ok "  7a: focus_score.cpp copied (always updated)"
-for f in focus_score.h rknn_api.h rknn_box_priors.h; do
+cp "$FILES_UVC/focus_score.h"   "$UVC_SRC/uvc/focus_score.h"
+ok "  7a: focus_score.cpp/h copied (always updated)"
+for f in rknn_api.h rknn_box_priors.h; do
     if [[ -f "$UVC_SRC/uvc/$f" ]] && grep -q "RKNN\|face_det\|BOX_PRIORS" "$UVC_SRC/uvc/$f" 2>/dev/null; then
         skip "  7a: $f already present"
     else
@@ -999,12 +1000,9 @@ else
     cp "$REPO_DIR/files/uvc/isp_ipc.h"   "$UVC_ISP_DIR/isp_ipc.h"
     ok "  8a: isp_ipc.h copied to $UVC_ISP_DIR"
 fi
-if [[ -f "$UVC_SRC/uvc/isp_ipc.cpp" ]]; then
-    skip "  8a: isp_ipc.cpp already in UVC source"
-else
-    cp "$REPO_DIR/files/uvc/isp_ipc.cpp" "$UVC_SRC/uvc/isp_ipc.cpp"
-    ok "  8a: isp_ipc.cpp copied to $UVC_SRC/uvc"
-fi
+# isp_ipc.cpp always overwritten so IPC command changes propagate
+cp "$REPO_DIR/files/uvc/isp_ipc.cpp" "$UVC_SRC/uvc/isp_ipc.cpp"
+ok "  8a: isp_ipc.cpp copied to $UVC_SRC/uvc (always updated)"
 
 # 8b. CMakeLists.txt — add isp_ipc.cpp alongside focus_score.cpp
 if grep -q "isp_ipc.cpp" "$CMAKE_FILE8"; then

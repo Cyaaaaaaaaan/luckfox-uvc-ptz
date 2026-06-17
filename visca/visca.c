@@ -159,7 +159,7 @@ static void handle_inquiry(int sock, struct sockaddr *src, socklen_t srclen,
         reply_inq(sock, src, srclen, data, 1);
         printf("[inq]      ae_sensitivity -> 0x01 (stub)\n");
     } else if (cat == 0x06 && cmd == 0x06) {
-        /* Menu state — always report closed (02) */
+        /* Menu state — always report closed (controller won't show menu UI) */
         data[0] = 0x02;
         reply_inq(sock, src, srclen, data, 1);
         printf("[inq]      menu -> closed\n");
@@ -210,8 +210,14 @@ void visca_handle(int sock, struct sockaddr *src, socklen_t srclen,
     } else if (cat == 0x04 && cmd == 0x35) {
         handle_wb_mode(sock, src, srclen, buf, len);
     } else if (cat == 0x06 && cmd == 0x06) {
-        /* OSD menu open/close — ACK, we don't implement OSD menu */
-        printf("[menu]     ignored (no OSD menu)\n");
+        /* Repurpose menu button: cycle display mode 0→1→2→0
+         * 0=all off  1=facebox only  2=facebox+OSD */
+        static int s_menu_mode = 0;
+        s_menu_mode = (s_menu_mode + 1) % 3;
+        char ipc_cmd[32];
+        snprintf(ipc_cmd, sizeof(ipc_cmd), "display %d", s_menu_mode);
+        isp_ctrl_send(ipc_cmd);
+        printf("[menu]     display mode -> %d\n", s_menu_mode);
         reply(sock, src, srclen);
     } else if (cat == 0x04 && cmd == 0x3F) {
         /* Memory recall — ACK only */
