@@ -201,11 +201,54 @@ Tilt must clamp at the ±45° software limits derived from homing; pan is contin
 
 ---
 
-## 8. Implementation order (when hardware arrives)
+## 8. Implementation order
+
+**Phase 0 — EPTZ digital PTZ (NO hardware, do this first; see §9.3):**
+0a. Add an EPTZ helper in `rk_mpi_uvc` calling `RK_MPI_VI_SetEptz` (crop-rect state: center x/y + zoom factor).
+0b. Add IPC commands over the existing `/tmp/visca_isp.sock`: `zoom <0..100>`, `pan <delta>`, `tilt <delta>` (or absolute `eptz x y w h`).
+0c. In `visca.c`, route the VISCA zoom (`04 07`) and pan/tilt (`06 01`) handlers to those IPC commands *in addition to* `motor_*`. Result: **working digital PTZ over the KC2000 with zero motor hardware.**
+0d. Verify EPTZ behaves on our patched pipeline (VPSS disabled, 2592×1944 max — see §9.3 caveat).
+
+**Phase 1+ — mechanical (when hardware arrives):**
 1. DTS: enable `uart3` + `i2c3`, rebuild dtb, confirm `/dev/ttyS3` and `/dev/i2c-3` appear.
-2. Bring up I²C: detect PCA9685 + AS5600L addresses (`i2cdetect`).
+2. Bring up I²C: detect PCA9685 + AS5600L addresses (`i2cdetect -y 3`).
 3. `motor.c`: PCA9685 PWM driver → DRV8833; verify focus/zoom motors spin both directions.
 4. AS5600L read + multi-turn tracking; implement homing (6a/6b).
-5. TMC2209 UART velocity mode for pan/tilt; wire to `motor_pan/tilt`.
+5. TMC2209 UART velocity mode for pan/tilt; wire to `motor_pan/tilt`. (Or evaluate the rk_motor 28BYJ-48 path — §9.1.)
 6. Hill-climbing autofocus (6c) on top of the now-reliable focus score.
-7. VISCA preset recall (`04 3F`) → store/restore encoder positions.
+7. VISCA preset recall (`04 3F`) → store/restore encoder positions (+ EPTZ state).
+
+---
+
+## 9. SDK assets discovered (research)
+
+### 9.1 Ready-made pan/tilt stepper driver — `sysdrv/drv_ko/motor/`
+A Rockchip kernel module for **2-axis (X/Y) pan/tilt** of **28BYJ-48 unipolar steppers** (via ULN2003, 4 GPIO/motor = 8 GPIO total). Clean `/dev` ioctl API: `MOTOR_MOVE / RESET / STOP / SPEED / GOBACK / CRUISE / GET_STATUS`, plus a userspace API (`rk_motor_move`, `rk_motor_reset`, `rk_motor_get_status`, …) in `src/rk_motor.h`. Open-loop step counting with **software limits** (`HORIZONTAL_MAX_STEPS 4000`, `VERTICAL_MAX_STEPS 2000`) → no physical endstops needed. DTS binding `compatible="motor"` with `motorA..H-gpios` (example uses GPIO1_C0..C7 — note GPIO1_C7 is our LED and C4/C5 are UART4, so remap if used).
+
+**Strategic option:** 28BYJ-48 steppers are tiny, cheap, 5V — matching the "small & cheap, not NEMA/TMC2209" goal stated earlier. This driver gives pan/tilt with homing + limits + a built-in `CRUISE`/patrol mode essentially for free. Trade-off: 8 GPIO (we're pin-constrained — see §3), lower torque, no microstep smoothness. **Decision pending:** 28BYJ-48 + rk_motor (simple, GPIO-heavy) vs. TMC2209-over-UART (pin-light, smoother, custom driver). The rk_motor API is a good template either way.
+
+### 9.2 rkaiq AF actuates VCMs, not our lens — validates the custom AF
+`drivers/media/i2c/` ships VCM drivers (`dw9714`, `dw9768`, `dw9800w`, `dw9807-vcm`, `ak7375`) and a thin `hall-dc-motor` v4l2 subdev (`compatible="rockchip,hall-dc"`). rkaiq's AF (`rk_aiq_user_api2_af_*`, `final_pos`, search path) is built to drive these **VCM** actuators. Our focus is a **DC gear motor on a C/CS ring** — not a VCM — so rkaiq cannot actuate it. This **confirms the design**: use rkaiq's sharpness *measurement* (Patch 9) + our own hill-climb to drive the DC motor (§6c). Do **not** expect rkaiq AF to move the lens.
+
+### 9.3 EPTZ — motorless digital pan/tilt/zoom (high value, do first)
+`RK_MPI_VI_SetEptz(ViPipe, ViChn, VI_CROP_INFO_S)` is in the shipped headers (`media/out/include/rk_mpi_vi.h`) and the app already uses `RK_MPI_VI`. It crops a rect from the **2592×1944** sensor and scales it to the output — i.e. **digital zoom (shrink rect), pan/tilt (move rect origin)**, live on a running stream (the sample calls it in a loop).
+
+```c
+VI_CROP_INFO_S c = {0};
+c.bEnable = RK_TRUE;
+c.enCropCoordinate = VI_CROP_ABS_COOR;      // absolute pixels (RATIO_COOR=0 also available)
+c.stCropRect = (RECT_S){ x, y, w, h };       // smaller w/h centered = zoom in; move x/y = pan/tilt
+RK_MPI_VI_SetEptz(0, 0, c);
+```
+**Architecture fit is perfect:** VISCA zoom/pan/tilt → existing `/tmp/visca_isp.sock` IPC → `SetEptz` in `rk_mpi_uvc`. Reuses the exact plumbing built for AE/WB. Gives **working PTZ over the KC2000 with no motors** as an immediate milestone, and stays useful afterwards as fast/fine digital trim, electronic stabilization, and zoom range before the optical zoom motor exists.
+- **Caveat to test:** our pipeline disabled VPSS (Patch 6) and runs 2592×1944 max (Patch 1 set `stMaxSize`). Confirm `SetEptz` crop+scale works in this config and doesn't re-trigger the VI/ISP SOF-disorder that Patches 1–3 fixed. Validate before relying on it.
+- **Quality note:** digital zoom trades resolution; pair coarse optical zoom (motor) with fine EPTZ later. Pan/tilt range is limited to the slack between crop and full sensor.
+
+### 9.4 Userspace hardware access (kernel is already configured for it)
+From `luckfox_rv1106_linux_defconfig`: `CONFIG_I2C_CHARDEV=y` (`/dev/i2c-N`), `CONFIG_SPI_SPIDEV=y`, `CONFIG_GPIO_SYSFS=y` (legacy `/sys/class/gpio`), `CONFIG_PWM_ROCKCHIP=y`, `CONFIG_SERIAL_8250=y` (RV1106 UARTs are 8250/dw-compatible → `/dev/ttyS3`). **Not** set: `CONFIG_PWM_SYSFS` (no `/sys/class/pwm` — reconfirms SoC PWM is impractical, use PCA9685) and `CONFIG_GPIO_CDEV` (no libgpiod — use legacy sysfs GPIO).
+
+So `motor.c` userspace toolkit, no kernel rebuild needed beyond enabling the bus nodes (§5):
+- **TMC2209:** `/dev/ttyS3` + termios
+- **PCA9685 + AS5600L:** `/dev/i2c-3` + `I2C_SLAVE` ioctl + read/write
+- **Direct GPIO** (TMC2209 EN, DRV8833 sleep, etc.): legacy `/sys/class/gpio` export/direction/value
+- **No** usable SoC hardware PWM from userspace → PCA9685 is the actuator path for DC motors.
