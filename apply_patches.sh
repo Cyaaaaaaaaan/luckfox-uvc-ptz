@@ -816,7 +816,10 @@ PROC_FILE7="$UVC_SRC/uvc/uvc_process.cpp"
 info "Patch 7: RKNN face detection + focus scoring OSD"
 
 # 7a. Copy new source files
-for f in focus_score.cpp focus_score.h rknn_api.h rknn_box_priors.h; do
+# focus_score.cpp is always overwritten so ISP sharpness changes propagate
+cp "$FILES_UVC/focus_score.cpp" "$UVC_SRC/uvc/focus_score.cpp"
+ok "  7a: focus_score.cpp copied (always updated)"
+for f in focus_score.h rknn_api.h rknn_box_priors.h; do
     if [[ -f "$UVC_SRC/uvc/$f" ]] && grep -q "RKNN\|face_det\|BOX_PRIORS" "$UVC_SRC/uvc/$f" 2>/dev/null; then
         skip "  7a: $f already present"
     else
@@ -1046,6 +1049,36 @@ else
 fi
 
 ok "Patch 8 complete: ISP IPC server"
+
+# ═════════════════════════════════════════════════════════════════════════════
+# PATCH 9 — Hardware ISP sharpness for focus scoring
+#   9a. Expose rkuvc_aiq_get_ctx() in isp.h
+# (focus_score.cpp is already updated via the always-copy in Patch 7a)
+# ═════════════════════════════════════════════════════════════════════════════
+ISP_H="$UVC_SRC/isp/isp.h"
+
+info "Patch 9: Hardware ISP sharpness for focus scoring"
+
+if grep -q "rkuvc_aiq_get_ctx" "$ISP_H"; then
+    skip "  9a: rkuvc_aiq_get_ctx already declared in isp.h"
+else
+    replace_in_file "$ISP_H" \
+'// auto focus' \
+'// rkaiq context — for direct API access (e.g. AF sharpness stats)
+#ifdef __cplusplus
+extern "C" {
+#endif
+struct rk_aiq_sys_ctx_s *rkuvc_aiq_get_ctx(int cam_id);
+#ifdef __cplusplus
+}
+#endif
+
+// auto focus' \
+    && ok "  9a: rkuvc_aiq_get_ctx declared in isp.h" \
+    || error "  9a: could not add rkuvc_aiq_get_ctx to isp.h"
+fi
+
+ok "Patch 9 complete: hardware ISP sharpness"
 
 echo ""
 ok "══════════════════════════════════════════"

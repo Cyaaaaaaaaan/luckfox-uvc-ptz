@@ -162,7 +162,7 @@ if [[ $BUILD_UVC -eq 1 ]]; then
     [[ ${PIPESTATUS[0]} -eq 0 ]] || error "SDK app build failed. See: $SDK_DIR/build_app.log"
 
     UVC_BIN_CANDIDATES=(
-        "$SDK_DIR/project/app/uvc_app_tiny/out/bin/rk_mpi_uvc"
+        "$SDK_DIR/project/app/uvc_app_tiny/build/rk_mpi_uvc"
         "$SDK_DIR/project/app/out/bin/rk_mpi_uvc"
         "$SDK_DIR/output/out/app_out/bin/rk_mpi_uvc"
     )

@@ -17,7 +17,7 @@ Fixes resolution switching, removes YUYV, enforces 4:3-only resolutions, sets up
 ## Repository layout
 
 ```
-apply_patches.sh       — idempotent SDK patcher (patches 1–8)
+apply_patches.sh       — idempotent SDK patcher (patches 1–9)
 build-app.sh           — build rk_mpi_uvc + visca_server, print deploy commands
 RkLunch.sh             — boot launcher (replaces factory rkipc launcher)
 files/
@@ -53,6 +53,7 @@ Patches are applied by `apply_patches.sh` (idempotent — safe to re-run).
 | 6 | `uvc_mpi_config.c` | Sets native 2592×1944 max size, disables VPSS (incompatible on RV1106 at full res) |
 | 7 | `focus_score.cpp` + wiring | RKNN RetinaFace face detection, Tenengrad focus scoring, green OSD bounding box |
 | 8 | `isp_ipc.cpp` + wiring | Unix socket IPC server — receives AE/WB commands from `visca_server` and applies them via rkaiq |
+| 9 | `focus_score.cpp` + `isp.h` | Replace CPU Tenengrad with hardware ISP sharpness stats via `rk_aiq_user_api2_af_GetSearchPath()` — zero CPU cost, updates every frame |
 
 **Key VI fix:** `RK_MPI_VI_DisableChn` on RV1106 triggers a full ISP restart → AIQ detects SOF disorder (frame counter reset) → VI permanently stops delivering frames. These patches replace DisableChn with in-place `RK_MPI_VI_SetChnAttr`, requiring `stIspOpt.stMaxSize` to be set to the sensor native max (2592×1944).
 
@@ -181,7 +182,7 @@ After a successful build, the script prints exact `scp`/`ssh` deploy commands �
 export PICO_IP=<board IP>        # e.g. 192.168.1.149
 
 # Paths (adjust if your SDK/repo are elsewhere)
-UVC_BIN=~/luckfox-pico/project/app/uvc_app_tiny/out/bin/rk_mpi_uvc
+UVC_BIN=~/luckfox-pico/project/app/uvc_app_tiny/build/rk_mpi_uvc
 VISCA_BIN=~/luckfox-uvc-ptz/visca/build/visca_server
 UVC_SRC=~/luckfox-pico/project/app/uvc_app_tiny/uvc_app
 RETINA_MODEL=~/luckfox-uvc-ptz/files/models/retinaface.rknn

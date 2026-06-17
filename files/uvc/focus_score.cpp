@@ -4,6 +4,8 @@
 #include "rk_mpi_vi.h"
 #include "rk_mpi_mb.h"
 #include "rk_mpi_sys.h"
+#include "isp.h"
+#include "rk_aiq_user_api2_af.h"
 #if FOCUS_SCORE_OSD
 #include "rk_mpi_rgn.h"
 #include "rk_mpi_venc.h"
@@ -457,6 +459,9 @@ static void downsample_nv12(uint8_t *dst, const uint8_t *src,
 
 /* Synchronous RetinaFace inference on one VI frame.
  * Pipeline: downsample → letterbox NV12→BGR 640×640 → rknn_run → parse. */
+static void af_set_window(int frame_w, int frame_h,
+                          int fx0, int fy0, int fx1, int fy1, int valid);
+
 static void face_det_run(const uint8_t *nv12, int w, int h, int stride)
 {
     if (!s_rknn_ctx || !s_input_mem) return;
@@ -585,10 +590,51 @@ static void face_det_run(const uint8_t *nv12, int w, int h, int stride)
     s_face_valid = valid;
     pthread_mutex_unlock(&s_face_mutex);
 
+    /* Update ISP AF measurement window to face region (or full frame) */
+    af_set_window(w, h, fx0, fy0, fx1, fy1, valid);
+
 #if FOCUS_SCORE_OSD
     face_box_draw(valid ? fx0 : 0, valid ? fy0 : 0,
                   valid ? fx1 : 0, valid ? fy1 : 0);
 #endif
+}
+
+/* Set rkaiq AF measurement window to face bbox (pixels), or full frame.
+ * Called after every face detection run so the ISP scores the right region. */
+static void af_set_window(int frame_w, int frame_h,
+                          int fx0, int fy0, int fx1, int fy1, int valid)
+{
+    rk_aiq_sys_ctx_t *ctx = rkuvc_aiq_get_ctx(s_pipe_id);
+    if (!ctx) return;
+
+    rk_aiq_af_attrib_t attr;
+    memset(&attr, 0, sizeof(attr));
+    attr.sync.sync_mode = RK_AIQ_UAPI_MODE_ASYNC;
+
+    if (valid && fx1 > fx0 && fy1 > fy0) {
+        /* Convert 10000-scale bbox to pixels */
+        int px0 = fx0 * frame_w / 10000;
+        int py0 = fy0 * frame_h / 10000;
+        int px1 = fx1 * frame_w / 10000;
+        int py1 = fy1 * frame_h / 10000;
+        /* Clamp to frame */
+        if (px0 < 0) px0 = 0;
+        if (py0 < 0) py0 = 0;
+        if (px1 > frame_w) px1 = frame_w;
+        if (py1 > frame_h) py1 = frame_h;
+        attr.h_offs = px0;
+        attr.v_offs = py0;
+        attr.h_size = (unsigned int)(px1 - px0);
+        attr.v_size = (unsigned int)(py1 - py0);
+    } else {
+        /* Full frame */
+        attr.h_offs = 0;
+        attr.v_offs = 0;
+        attr.h_size = (unsigned int)frame_w;
+        attr.v_size = (unsigned int)frame_h;
+    }
+
+    rk_aiq_user_api2_af_SetAttrib(ctx, &attr);
 }
 
 /* Return the crop rect to score — face bbox with padding, or center crop. */
@@ -679,17 +725,30 @@ static void *focus_thread(void *arg)
                     face_det_run(y_plane, w, h, stride);
                 }
 #endif
-                int cx, cy, cw, ch;
-                get_crop(w, h, &cx, &cy, &cw, &ch);
-
-                double score = tenengrad_score(y_plane, stride, cx, cy, cw, ch);
+                /* Hardware ISP sharpness stat — zero CPU cost, updated every frame.
+                 * Falls back to Tenengrad if the ISP context is unavailable. */
+                double score = 0.0;
+                rk_aiq_sys_ctx_t *aiq_ctx = rkuvc_aiq_get_ctx(s_pipe_id);
+                if (aiq_ctx) {
+                    rk_aiq_af_sec_path_t path;
+                    memset(&path, 0, sizeof(path));
+                    if (rk_aiq_user_api2_af_GetSearchPath(aiq_ctx, &path) == XCAM_RETURN_NO_ERROR
+                            && path.search_num > 0) {
+                        score = (double)path.sharpness[0];
+                    }
+                }
+                if (score == 0.0) {
+                    /* fallback: Tenengrad on face/center crop */
+                    int cx, cy, cw, ch;
+                    get_crop(w, h, &cx, &cy, &cw, &ch);
+                    score = tenengrad_score(y_plane, stride, cx, cy, cw, ch);
+                }
                 s_score = score;
 
                 FILE *f = fopen(FOCUS_SCORE_PATH, "w");
                 if (f) { fprintf(f, "%.1f\n", score); fclose(f); }
 
-                LOG_INFO("focus_score: %.1f  (%dx%d crop=%dx%d@%d,%d)\n",
-                         score, w, h, cw, ch, cx, cy);
+                LOG_INFO("focus_score: %.1f  (%dx%d)\n", score, w, h);
 
 #if FOCUS_SCORE_OSD
                 osd_update(score);
