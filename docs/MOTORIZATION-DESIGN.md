@@ -254,3 +254,19 @@ So `motor.c` userspace toolkit, no kernel rebuild needed beyond enabling the bus
 - **PCA9685 + AS5600L:** `/dev/i2c-3` + `I2C_SLAVE` ioctl + read/write
 - **Direct GPIO** (TMC2209 EN, DRV8833 sleep, etc.): legacy `/sys/class/gpio` export/direction/value
 - **No** usable SoC hardware PWM from userspace → PCA9685 is the actuator path for DC motors.
+
+### 9.5 Motorless face auto-tracking (emergent feature — no new hardware, no IPC)
+`focus_score.cpp` already computes the most-centred face bbox each detection (`s_face_x0..y1`, `s_face_valid`, 10000-scale, mutex-guarded) — currently consumed only internally by `get_crop()`. **Face detection and EPTZ (§9.3) both live in `rk_mpi_uvc`**, so auto-tracking is fully self-contained in that one process, no IPC:
+
+```
+each detection: if face_valid:
+    err_x = face_center_x - frame_center_x
+    err_y = face_center_y - frame_center_y
+    if |err| > deadzone: nudge EPTZ crop origin toward the face (P-controller, clamped to sensor)
+    optionally shrink crop (zoom) to frame the face at a target size
+```
+This gives a true **auto-tracking PTZ that keeps the subject centred — with zero motors** — built entirely on existing parts (RetinaFace + EPTZ). Natural roadmap: Phase 0 manual EPTZ → Phase 0.5 face auto-track → Phase 1+ hand off to mechanical pan/tilt once it exists (EPTZ then becomes the fine/fast trim layer on top of coarse mechanical motion).
+
+### 9.6 Complements (lower priority)
+- **`move_detection`** (`media/common_algorithm/.../move_detect/`): software motion detector (`move_detection_init/_set_params/_set_sensitivity`, ROI in, region list out; runs on a downscaled Y plane). Useful as a tracking trigger when **no face** is present (track motion instead). Also an `occlusion_detect` algo (tamper/blocked-lens detection).
+- **RGA** (2D accelerator) is shipped (`media/out/include/rga/`) and already linked by the UVC app. Could **offload the manual `downsample_nv12()`** in `focus_score.cpp` (and any EPTZ-side scaling) from CPU to the RGA block — a perf win if the detection/scoring path ever gets heavy. Not needed now.
