@@ -241,10 +241,18 @@ c.stCropRect = (RECT_S){ x, y, w, h };       // smaller w/h centered = zoom in; 
 RK_MPI_VI_SetEptz(0, 0, c);
 ```
 **Architecture fit is perfect:** VISCA zoom/pan/tilt → existing `/tmp/visca_isp.sock` IPC → `SetEptz` in `rk_mpi_uvc`. Reuses the exact plumbing built for AE/WB. Gives **working PTZ over the KC2000 with no motors** as an immediate milestone, and stays useful afterwards as fast/fine digital trim, electronic stabilization, and zoom range before the optical zoom motor exists.
-- **Caveat to test:** our pipeline disabled VPSS (Patch 6) and runs 2592×1944 max (Patch 1 set `stMaxSize`). Confirm `SetEptz` crop+scale works in this config and doesn't re-trigger the VI/ISP SOF-disorder that Patches 1–3 fixed. Validate before relying on it.
+- **Risk assessment (researched):** `SetEptz` is a **live operation** — both the RTSP sample and `rockit/.../test_mpi_vi.cpp` call it on a running channel and only ever use `RK_MPI_VI_DisableChn` in teardown. So EPTZ should **not** re-trigger the `DisableChn`-induced SOF-disorder that Patches 1–3 fix. EPTZ/zoom is also a first-class UVC feature in rockit (`RTUVCGraph.h`: `setEptz`, `setZoom`, `eptz_zoom` modes). **Net: low risk.** The one thing still worth a quick on-hardware check is that the crop+**scale** works with VPSS disabled (Patch 6) at 2592 native — EPTZ scaling is an ISP/VI-level function (independent of VPSS), so it's expected to work, but confirm visually.
 - **Res-switch interaction:** the app changes UVC resolution via in-place `RK_MPI_VI_SetChnAttr` (`uvc_mpi_vi.cpp`). That will reset the crop, so the EPTZ state must be **re-applied after every resolution switch** (re-call `SetEptz` at the end of the resize path). Canonical helper to copy: `media/samples/example/common/sample_comm_vi.c` (gated by `bIfOpenEptz`, calls `RK_MPI_VI_SetEptz` at channel setup).
 - **Coordinate choice:** all SDK samples use `VI_CROP_ABS_COOR` (absolute pixels) — use that. `VI_CROP_RATIO_COOR` also exists and would survive res changes without rescaling, but its scale is undocumented in the shipped headers — verify empirically before relying on it. Simplest robust approach: keep EPTZ state as a normalized center+zoom in our own code and recompute the absolute rect (against the current output size) each time we apply it.
 - **Quality note:** digital zoom trades resolution; pair coarse optical zoom (motor) with fine EPTZ later. Pan/tilt range is limited to the slack between crop and full sensor.
+- **Zoom headroom is quantified by the sensor (researched):** the MIS5001 driver (`drivers/media/i2c/mis5001.c`) has a **single mode, 2592×1944 @ 30fps** — every UVC resolution is an ISP downscale of that one frame. So EPTZ always crops from the full 2592×1944, and **lossless** digital zoom = sensor÷output per axis:
+  | UVC output | Lossless zoom (crop=output px) | Notes |
+  |---|---|---|
+  | 640×480 | up to **4.05×** | most EPTZ headroom |
+  | 1280×960 | up to **2.0×** | |
+  | 2048×1536 | up to **1.27×** | |
+  | 2592×1944 | **1.0×** (none) | already full sensor |
+  Beyond the lossless factor EPTZ upscales (softens). Pan/tilt range = the unused sensor margin around the crop. **Implication:** EPTZ is most powerful at the lower stream resolutions — exactly where USB-2.0 bandwidth pushes you anyway.
 
 ### 9.4 Userspace hardware access (kernel is already configured for it)
 From `luckfox_rv1106_linux_defconfig`: `CONFIG_I2C_CHARDEV=y` (`/dev/i2c-N`), `CONFIG_SPI_SPIDEV=y`, `CONFIG_GPIO_SYSFS=y` (legacy `/sys/class/gpio`), `CONFIG_PWM_ROCKCHIP=y`, `CONFIG_SERIAL_8250=y` (RV1106 UARTs are 8250/dw-compatible → `/dev/ttyS3`). **Not** set: `CONFIG_PWM_SYSFS` (no `/sys/class/pwm` — reconfirms SoC PWM is impractical, use PCA9685) and `CONFIG_GPIO_CDEV` (no libgpiod — use legacy sysfs GPIO).
