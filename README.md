@@ -177,6 +177,10 @@ eptz dzoom <f>                 — relative zoom step
 eptz pan <f>                   — relative crop-center move (+ = right)
 eptz tilt <f>                  — relative crop-center move (+ = down)
 eptz center <cx> <cy>          — absolute center, normalized 0..1
+
+# Face auto-tracking
+autotrack on | off             — P-controller: nudges EPTZ center to keep face centered
+                                 (also enables EPTZ automatically when turned on)
 ```
 
 ### EPTZ — motorless digital pan/tilt/zoom (Patch 10)
@@ -199,8 +203,31 @@ send(){ python3 -c "import socket,sys;s=socket.socket(socket.AF_UNIX,socket.SOCK
 send "eptz on"; send "eptz zoom 2.0"; send "eptz pan 0.1"; send "eptz reset"; send "eptz off"
 ```
 
-> Untested on hardware as of this commit — verify the crop+scale renders with
+> EPTZ is untested on hardware as of this commit — verify the crop+scale renders with
 > VPSS disabled (Patch 6) at the native 2592 config before relying on it.
+
+### Face auto-tracking (Phase 0.5)
+
+When enabled, the focus-score thread runs a proportional controller after each
+face detection (~500 ms cadence) that nudges the EPTZ crop center to keep the
+detected face centered in frame.  **No new thread** — runs inside the existing
+face detection cycle.
+
+Algorithm:
+- Face center from bbox (10000-scale coords): `fcx = (x0+x1)/2 / 10000`
+- Error: `ex = fcx - 0.5, ey = fcy - 0.5` (both in [−0.5, 0.5])
+- Dead-zone: ±4% of frame width/height — no movement if face is already near center
+- EPTZ adjustment: `eptz_pan(ex × 0.35)`, `eptz_tilt(ey × 0.35)` per detection cycle
+- Enabling autotrack automatically enables EPTZ; disabling leaves EPTZ at current position
+
+Enable via IPC:
+```sh
+S=/tmp/visca_isp.sock
+send(){ python3 -c "import socket,sys;s=socket.socket(socket.AF_UNIX,socket.SOCK_DGRAM);s.connect('$S');s.send(sys.argv[1].encode())" "$1"; }
+send "autotrack on"   # EPTZ activates + face tracking starts
+send "autotrack off"  # tracking stops, EPTZ holds current position
+send "eptz reset"     # optionally recenter after disabling
+```
 
 These IPC commands can also be sent directly from the board for testing:
 ```sh

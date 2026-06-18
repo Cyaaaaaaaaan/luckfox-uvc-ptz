@@ -137,6 +137,12 @@ static void apply_cmd(const char *cmd) {
         if (sscanf(cmd + 12, "%f %f", &cx, &cy) == 2)
             eptz_set_center(cx, cy);
 
+    /* ── Face auto-tracking ──────────────────────────────────────────── */
+    } else if (strcmp(cmd, "autotrack on") == 0) {
+        focus_score_set_autotrack(1);
+    } else if (strcmp(cmd, "autotrack off") == 0) {
+        focus_score_set_autotrack(0);
+
     /* ── Picture quality ─────────────────────────────────────────────── */
     } else if (strncmp(cmd, "contrast ", 9) == 0) {
         rk_isp_set_contrast(s_cam_id, atoi(cmd + 9));

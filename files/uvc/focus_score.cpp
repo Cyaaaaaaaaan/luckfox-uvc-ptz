@@ -1,4 +1,5 @@
 #include "focus_score.h"
+#include "eptz.h"
 #include "uvc_mpi_vi.h"
 #include "uvc_log.h"
 #include "rk_mpi_vi.h"
@@ -412,10 +413,11 @@ static size_t           s_det_buf_sz  = 0;
 static int              s_det_tick    = 0;
 
 /* Face bounding box in 10000-scale coords — updated each inference run */
-static pthread_mutex_t s_face_mutex = PTHREAD_MUTEX_INITIALIZER;
-static int16_t s_face_x0 = 0, s_face_y0 = 0;
-static int16_t s_face_x1 = 0, s_face_y1 = 0;
-static int     s_face_valid = 0;
+static pthread_mutex_t  s_face_mutex  = PTHREAD_MUTEX_INITIALIZER;
+static int16_t          s_face_x0 = 0, s_face_y0 = 0;
+static int16_t          s_face_x1 = 0, s_face_y1 = 0;
+static int              s_face_valid  = 0;
+static volatile int     s_autotrack   = 0; /* P-controller → EPTZ auto-tracking */
 
 static void face_det_init(void)
 {
@@ -766,6 +768,25 @@ static void *focus_thread(void *arg)
                 if (++s_det_tick >= FACE_DET_EVERY) {
                     s_det_tick = 0;
                     face_det_run(y_plane, w, h, stride);
+
+                    /* ── Face auto-tracking P-controller ──────────────── */
+                    if (s_autotrack) {
+                        pthread_mutex_lock(&s_face_mutex);
+                        int at_valid = s_face_valid;
+                        int at_x0 = s_face_x0, at_y0 = s_face_y0;
+                        int at_x1 = s_face_x1, at_y1 = s_face_y1;
+                        pthread_mutex_unlock(&s_face_mutex);
+                        if (at_valid) {
+                            float fcx = (at_x0 + at_x1) * 0.5f / 10000.0f;
+                            float fcy = (at_y0 + at_y1) * 0.5f / 10000.0f;
+                            float ex  = fcx - 0.5f;
+                            float ey  = fcy - 0.5f;
+                            if (fabsf(ex) > 0.04f || fabsf(ey) > 0.04f) {
+                                eptz_pan(ex  * 0.35f);
+                                eptz_tilt(ey * 0.35f);
+                            }
+                        }
+                    }
                 }
 #endif
                 /* Hardware ISP sharpness stat — zero CPU cost, updated every frame.
@@ -811,6 +832,17 @@ static void *focus_thread(void *arg)
     remove(FOCUS_SCORE_PATH);
     LOG_INFO("focus_score: thread exited\n");
     return NULL;
+}
+
+void focus_score_set_autotrack(int on)
+{
+    s_autotrack = on ? 1 : 0;
+    if (on) eptz_enable(1);
+}
+
+int focus_score_get_autotrack(void)
+{
+    return s_autotrack;
 }
 
 void focus_score_start(int pipe_id, int chn_id)

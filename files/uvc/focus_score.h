@@ -40,6 +40,12 @@ void focus_score_osd_detach(int venc_dev, int venc_chn);
 void focus_score_set_display_mode(int mode);
 int  focus_score_get_display_mode(void);
 
+/* Face auto-tracking: P-controller that nudges the EPTZ crop to keep the
+ * largest detected face centered.  Calling set_autotrack(1) also calls
+ * eptz_enable(1) so EPTZ activates automatically.  Requires FOCUS_SCORE_FACE_DETECT. */
+void focus_score_set_autotrack(int on);
+int  focus_score_get_autotrack(void);
+
 #ifdef __cplusplus
 }
 #endif
