@@ -32,6 +32,7 @@ static void reply_inq(int sock, struct sockaddr *src, socklen_t srclen,
 
 /* ── Shadow state (for inquiry responses) ────────────────────────────────── */
 
+static int     s_menu_open     = 0;    /* 1 = OSD camera menu is open, intercept nav */
 static uint8_t s_ae_mode       = 0x00; /* 00=auto 03=manual */
 static uint8_t s_wb_mode       = 0x00; /* 00=auto 01=indoor 02=outdoor 05=manual */
 static uint8_t s_sharpness     = 0x08; /* 0x00-0x0F, mid=8 */
@@ -77,6 +78,17 @@ static void handle_pan_tilt(int sock, struct sockaddr *src, socklen_t srclen,
     int td = (p[7] == 0x01) ? MOTOR_FWD  :
              (p[7] == 0x02) ? MOTOR_REV  : MOTOR_STOP;
 
+    /* When the OSD menu is open, intercept tilt for cursor navigation */
+    if (s_menu_open) {
+        if (td == MOTOR_FWD && tilt_spd > 0)
+            isp_ctrl_send("menu up");
+        else if (td == MOTOR_REV && tilt_spd > 0)
+            isp_ctrl_send("menu down");
+        /* pan is ignored in menu mode */
+        reply(sock, src, srclen);
+        return;
+    }
+
     printf("[pan/tilt] pan=%s spd=%d  tilt=%s spd=%d\n",
            dir_name(pd), pan_spd, dir_name(td), tilt_spd);
     motor_pan(pd, pan_spd);
@@ -106,6 +118,14 @@ static void handle_zoom(int sock, struct sockaddr *src, socklen_t srclen,
     int dir   = (pp == 0x00)          ? MOTOR_STOP :
                 ((pp & 0xF0) == 0x20) ? MOTOR_FWD  : MOTOR_REV;
     int speed = pp & 0x0F;
+
+    /* When the OSD menu is open, intercept zoom for value editing */
+    if (s_menu_open && dir != MOTOR_STOP) {
+        isp_ctrl_send(dir == MOTOR_FWD ? "menu inc" : "menu dec");
+        reply(sock, src, srclen);
+        return;
+    }
+
     printf("[zoom]     dir=%s spd=%d (raw=0x%02x)\n", dir_name(dir), speed, pp);
     motor_zoom(dir, speed);
 
@@ -408,13 +428,18 @@ void visca_handle(int sock, struct sockaddr *src, socklen_t srclen,
         /* CAM_NR (noise reduction): 00=off 01-05=levels */
         handle_nr(sock, src, srclen, buf, len);
     } else if (cat == 0x06 && cmd == 0x06) {
-        /* Repurpose menu button: cycle display mode 0→1→2→0 */
-        static int s_menu_mode = 0;
-        s_menu_mode = (s_menu_mode + 1) % 3;
-        char ipc_cmd[32];
-        snprintf(ipc_cmd, sizeof(ipc_cmd), "display %d", s_menu_mode);
-        isp_ctrl_send(ipc_cmd);
-        printf("[menu]     display mode -> %d\n", s_menu_mode);
+        /* Menu button: toggle OSD camera menu.
+         * Open: tilt = cursor up/down; zoom = change value.
+         * Close: returns tilt/zoom to normal PTZ/EPTZ use. */
+        if (s_menu_open) {
+            s_menu_open = 0;
+            isp_ctrl_send("menu close");
+            printf("[menu]     closed\n");
+        } else {
+            s_menu_open = 1;
+            isp_ctrl_send("menu open");
+            printf("[menu]     opened\n");
+        }
         reply(sock, src, srclen);
     } else if (cat == 0x04 && cmd == 0x3F) {
         printf("[memory]   recall preset 0x%02x — ignored\n", (len > 5) ? buf[5] : 0);

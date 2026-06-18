@@ -1155,6 +1155,36 @@ fi
 
 ok "Patch 10 complete: EPTZ digital PTZ"
 
+# PATCH 11 — OSD Camera menu (menu_osd.cpp/.h)
+#   11a. Copy menu_osd.cpp/.h + always-overwrite isp_ipc.h (adds isp_apply_cmd)
+#   11b. Add menu_osd.cpp to CMakeLists.txt
+
+PATCH11_DESC="Patch 11: OSD camera menu (menu_osd.cpp)"
+CMAKE11="$UVC_SRC/CMakeLists.txt"
+
+info "$PATCH11_DESC"
+
+# 11a. always-overwrite menu_osd + isp_ipc.h so changes propagate
+cp "$FILES_UVC/menu_osd.cpp" "$UVC_SRC/uvc/menu_osd.cpp"
+cp "$FILES_UVC/menu_osd.h"   "$UVC_SRC/uvc/menu_osd.h"
+ok "  11a: menu_osd.cpp/h copied (always updated)"
+cp "$REPO_DIR/files/uvc/isp_ipc.h" "$UVC_ISP_DIR/isp_ipc.h"
+ok "  11a: isp_ipc.h overwritten (adds isp_apply_cmd)"
+
+# 11b. CMakeLists.txt — add menu_osd.cpp next to eptz.cpp
+if grep -q "uvc/menu_osd.cpp" "$CMAKE11"; then
+    skip "  11b: menu_osd.cpp already in CMakeLists.txt"
+else
+    replace_in_file "$CMAKE11" \
+'    uvc/eptz.cpp' \
+'    uvc/eptz.cpp
+    uvc/menu_osd.cpp' \
+    && ok "  11b: menu_osd.cpp added to CMakeLists.txt" \
+    || error "  11b: could not add menu_osd.cpp — check CMakeLists.txt manually"
+fi
+
+ok "Patch 11 complete: OSD camera menu"
+
 echo ""
 ok "══════════════════════════════════════════"
 ok " All patches applied successfully!"

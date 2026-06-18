@@ -1,5 +1,6 @@
 #include "focus_score.h"
 #include "eptz.h"
+#include "menu_osd.h"
 #include "uvc_mpi_vi.h"
 #include "uvc_log.h"
 #include "rk_mpi_vi.h"
@@ -323,6 +324,8 @@ void focus_score_osd_attach(int venc_dev, int venc_chn)
         LOG_INFO("focus_score: face box OVERLAY strips ready %dx%d\n", s_fbw, s_fbh);
     }
 #endif /* FOCUS_SCORE_FACE_DETECT */
+
+    menu_osd_attach(venc_dev, venc_chn);
 }
 
 /* Public: called from uvc_process stopProcess() before VENC is destroyed */
@@ -347,6 +350,7 @@ void focus_score_osd_detach(int venc_dev, int venc_chn)
         RK_MPI_RGN_Destroy(OSD_HANDLE);
     }
 
+    menu_osd_detach(venc_dev, venc_chn);
     LOG_INFO("focus_score OSD: detached\n");
 }
 

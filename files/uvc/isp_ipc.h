@@ -22,6 +22,10 @@ extern "C" {
 int  isp_ipc_start(int cam_id);  /* spawns listener thread; returns 0 on success */
 void isp_ipc_stop(void);
 
+/* Apply an ISP/system command directly (same handler as the IPC socket).
+ * Thread-safe — may be called from any thread inside rk_mpi_uvc. */
+void isp_apply_cmd(const char *cmd);
+
 #ifdef __cplusplus
 }
 #endif

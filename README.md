@@ -57,6 +57,7 @@ Patches are applied by `apply_patches.sh` (idempotent — safe to re-run).
 | 8 | `isp_ipc.cpp` + wiring | Unix socket IPC server — receives AE/WB commands from `visca_server` and applies them via rkaiq |
 | 9 | `focus_score.cpp` + `isp.h` | Replace CPU Tenengrad with hardware ISP sharpness stats via `rk_aiq_user_api2_af_GetSearchPath()` — zero CPU cost, updates every frame |
 | 10 | `eptz.cpp` + wiring | Digital pan/tilt/zoom via `RK_MPI_VI_SetEptz` (crop+scale of the sensor frame), driven by VISCA — motorless PTZ |
+| 11 | `menu_osd.cpp` + wiring | Full visual OSD camera menu — 14 settings, navigated from the KC2000 via menu button / tilt / zoom |
 
 **Key VI fix:** `RK_MPI_VI_DisableChn` on RV1106 triggers a full ISP restart → AIQ detects SOF disorder (frame counter reset) → VI permanently stops delivering frames. These patches replace DisableChn with in-place `RK_MPI_VI_SetChnAttr`, requiring `stIspOpt.stMaxSize` to be set to the sensor native max (2592×1944).
 
@@ -112,7 +113,7 @@ The score is always written to `/tmp/focus_score` regardless of display mode (`w
 | Mirror (LR flip) | `81 01 04 61 pp FF` | 02=mirror on, 03=mirror off → hardware ISP flip |
 | Anti-flicker | `81 01 04 23 pp FF` | 00=off→50Hz, 01=50Hz, 02=60Hz |
 | Noise reduction | `81 01 04 53 pp FF` | 00=off, 01-05=NR levels → mixnr + spatial/temporal |
-| CAM menu button | `81 01 06 06 pp FF` | cycles debug display mode 0→1→2→0 |
+| CAM menu button | `81 01 06 06 pp FF` | toggles OSD camera menu open/closed; tilt/zoom intercepted while open |
 | Memory recall | `81 01 04 3F 02 pp FF` | ACK only |
 
 Responses: `90 41 FF` (ACK) + `90 51 FF` (completion) per command.
@@ -228,6 +229,47 @@ send "autotrack on"   # EPTZ activates + face tracking starts
 send "autotrack off"  # tracking stops, EPTZ holds current position
 send "eptz reset"     # optionally recenter after disabling
 ```
+
+### OSD Camera menu (Patch 11)
+
+A full-screen settings overlay rendered as a 384×240 `OVERLAY_RGN` (handle 11) over the VENC output.
+All 14 picture-control settings are accessible without any external tool.
+
+**Controls on KC2000:**
+
+| Button | Menu closed | Menu open |
+|--------|-------------|-----------|
+| CAM MENU (`06 06`) | Open menu | Close menu |
+| Tilt up | motor/EPTZ tilt | Cursor ↑ |
+| Tilt down | motor/EPTZ tilt | Cursor ↓ |
+| Zoom in | motor/EPTZ zoom | Increment value |
+| Zoom out | motor/EPTZ zoom | Decrement value |
+| Pan | motor/EPTZ pan | (ignored) |
+
+**Menu items:**
+
+| Row | Setting | Range / Choices |
+|-----|---------|-----------------|
+| AE MODE | Exposure mode | AUTO · MANUAL |
+| BRIGHTNESS | Sensor brightness | 0–255 (step 8) |
+| CONTRAST | Sensor contrast | 0–255 (step 8) |
+| SATURATION | Color saturation | 0–255 (step 8) |
+| SHARPNESS | Edge sharpness | 0–15 |
+| WB MODE | White balance | AUTO · INDOOR · OUTDOOR · FLUORESC · INCAN · WARM · NATURAL · LOCK |
+| NR LEVEL | Noise reduction | OFF · LVL 1–5 |
+| BLC | Backlight comp. | OFF · ON |
+| HLC | Highlight comp. | OFF · ON |
+| ANTI-FLICKER | Power frequency | 50HZ · 60HZ |
+| MIRROR | Horizontal flip | OFF · ON |
+| DAY/NIGHT | IRCut + color mode | DAY · NIGHT |
+| EPTZ | Digital PTZ | OFF · ON |
+| AUTO-TRACK | Face tracking | OFF · ON |
+
+ISP changes apply **immediately** as values are changed — no confirm step.
+The menu canvas persists through resolution switches (re-attached transparently).
+
+Canvas: 384×240 px at position (16, 40) in VENC-output frame.
+Font: 8×8 bitmap at 2× scale (16×16 px per character cell), 24 chars × 15 rows.
 
 These IPC commands can also be sent directly from the board for testing:
 ```sh

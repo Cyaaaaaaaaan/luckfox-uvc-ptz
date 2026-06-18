@@ -11,6 +11,7 @@ extern "C" {
 #include "isp.h"
 #include "focus_score.h"
 #include "eptz.h"
+#include "menu_osd.h"
 }
 #include "isp_ipc.h"
 #include "rk_aiq_user_api2_imgproc.h"
@@ -143,6 +144,20 @@ static void apply_cmd(const char *cmd) {
     } else if (strcmp(cmd, "autotrack off") == 0) {
         focus_score_set_autotrack(0);
 
+    /* ── OSD Camera menu ─────────────────────────────────────────────── */
+    } else if (strcmp(cmd, "menu open") == 0) {
+        menu_osd_open();
+    } else if (strcmp(cmd, "menu close") == 0) {
+        menu_osd_close();
+    } else if (strcmp(cmd, "menu up") == 0) {
+        menu_osd_cursor_up();
+    } else if (strcmp(cmd, "menu down") == 0) {
+        menu_osd_cursor_down();
+    } else if (strcmp(cmd, "menu inc") == 0) {
+        menu_osd_value_inc();
+    } else if (strcmp(cmd, "menu dec") == 0) {
+        menu_osd_value_dec();
+
     /* ── Picture quality ─────────────────────────────────────────────── */
     } else if (strncmp(cmd, "contrast ", 9) == 0) {
         rk_isp_set_contrast(s_cam_id, atoi(cmd + 9));
@@ -250,6 +265,9 @@ int isp_ipc_start(int cam_id) {
     printf("[isp_ipc] listening on %s (cam %d)\n", ISP_IPC_SOCK_PATH, cam_id);
     return 0;
 }
+
+/* Non-static entry point so menu_osd.cpp can reuse the same command routing */
+void isp_apply_cmd(const char *cmd) { apply_cmd(cmd); }
 
 void isp_ipc_stop(void) {
     if (!s_running) return;
