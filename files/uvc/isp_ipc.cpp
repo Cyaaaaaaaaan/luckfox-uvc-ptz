@@ -9,6 +9,7 @@
 extern "C" {
 #include "isp.h"
 #include "focus_score.h"
+#include "eptz.h"
 }
 #include "isp_ipc.h"
 
@@ -62,6 +63,27 @@ static void apply_cmd(const char *cmd) {
     } else if (strcmp(cmd, "facebox off") == 0) {
         /* box off turns off everything (score requires box) */
         focus_score_set_display_mode(0);
+
+    /* ── EPTZ (digital pan/tilt/zoom) ─────────────────────────────── */
+    } else if (strcmp(cmd, "eptz on") == 0) {
+        eptz_enable(1);
+    } else if (strcmp(cmd, "eptz off") == 0) {
+        eptz_enable(0);
+    } else if (strcmp(cmd, "eptz reset") == 0) {
+        eptz_reset();
+    } else if (strncmp(cmd, "eptz zoom ", 10) == 0) {
+        eptz_set_zoom((float)atof(cmd + 10));
+    } else if (strncmp(cmd, "eptz dzoom ", 11) == 0) {
+        eptz_zoom_delta((float)atof(cmd + 11));
+    } else if (strncmp(cmd, "eptz pan ", 9) == 0) {
+        eptz_pan((float)atof(cmd + 9));
+    } else if (strncmp(cmd, "eptz tilt ", 10) == 0) {
+        eptz_tilt((float)atof(cmd + 10));
+    } else if (strncmp(cmd, "eptz center ", 12) == 0) {
+        float cx = 0.5f, cy = 0.5f;
+        if (sscanf(cmd + 12, "%f %f", &cx, &cy) == 2)
+            eptz_set_center(cx, cy);
+
     } else {
         printf("[isp_ipc] unknown cmd: %s\n", cmd);
     }

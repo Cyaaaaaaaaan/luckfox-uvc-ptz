@@ -17,17 +17,19 @@ Fixes resolution switching, removes YUYV, enforces 4:3-only resolutions, sets up
 ## Repository layout
 
 ```
-apply_patches.sh       — idempotent SDK patcher (patches 1–9)
+apply_patches.sh       — idempotent SDK patcher (patches 1–10)
 build-app.sh           — build rk_mpi_uvc + visca_server, print deploy commands
 RkLunch.sh             — boot launcher (replaces factory rkipc launcher)
 files/
-  uvc/                 — new source files injected by patches 7–8
-    focus_score.cpp    — RKNN face detection + Tenengrad focus scorer
+  uvc/                 — new source files injected by patches 7–10
+    focus_score.cpp    — RKNN face detection + hardware ISP focus scorer
     focus_score.h
     rknn_api.h
     rknn_box_priors.h  — RetinaFace 640×640 prior anchors
-    isp_ipc.cpp        — Unix socket IPC server (receives AE/WB cmds from visca_server)
+    isp_ipc.cpp        — Unix socket IPC server (AE/WB/display/EPTZ cmds from visca_server)
     isp_ipc.h
+    eptz.cpp           — digital pan/tilt/zoom via RK_MPI_VI_SetEptz
+    eptz.h
   models/
     retinaface.rknn    — bundled RetinaFace model (637 KB)
 patches/               — reference diffs for patches 1–5
@@ -54,6 +56,7 @@ Patches are applied by `apply_patches.sh` (idempotent — safe to re-run).
 | 7 | `focus_score.cpp` + wiring | RKNN RetinaFace face detection, Tenengrad focus scoring, green OSD bounding box |
 | 8 | `isp_ipc.cpp` + wiring | Unix socket IPC server — receives AE/WB commands from `visca_server` and applies them via rkaiq |
 | 9 | `focus_score.cpp` + `isp.h` | Replace CPU Tenengrad with hardware ISP sharpness stats via `rk_aiq_user_api2_af_GetSearchPath()` — zero CPU cost, updates every frame |
+| 10 | `eptz.cpp` + wiring | Digital pan/tilt/zoom via `RK_MPI_VI_SetEptz` (crop+scale of the sensor frame), driven by VISCA — motorless PTZ |
 
 **Key VI fix:** `RK_MPI_VI_DisableChn` on RV1106 triggers a full ISP restart → AIQ detects SOF disorder (frame counter reset) → VI permanently stops delivering frames. These patches replace DisableChn with in-place `RK_MPI_VI_SetChnAttr`, requiring `stIspOpt.stMaxSize` to be set to the sensor native max (2592×1944).
 
@@ -93,11 +96,11 @@ The score is always written to `/tmp/focus_score` regardless of display mode (`w
 
 | Command | VISCA bytes | Action |
 |---------|------------|--------|
-| Pan left/right | `81 01 06 01 VV WW XX YY FF` | `motor_pan(dir, speed)` |
-| Tilt up/down | `81 01 06 01 VV WW XX YY FF` | `motor_tilt(dir, speed)` |
-| Pan/tilt stop | `81 01 06 01 00 00 03 03 FF` | stop both |
-| Zoom in/out | `81 01 04 07 pp FF` | `motor_zoom(dir, speed)` |
-| Zoom stop | `81 01 04 07 00 FF` | stop zoom |
+| Pan left/right | `81 01 06 01 VV WW XX YY FF` | `motor_pan()` + EPTZ pan |
+| Tilt up/down | `81 01 06 01 VV WW XX YY FF` | `motor_tilt()` + EPTZ tilt |
+| Pan/tilt stop | `81 01 06 01 00 00 03 03 FF` | stop both (EPTZ holds) |
+| Zoom in/out | `81 01 04 07 pp FF` | `motor_zoom()` + EPTZ zoom |
+| Zoom stop | `81 01 04 07 00 FF` | stop zoom (EPTZ holds) |
 | Focus near/far | `81 01 04 08 pp FF` | `motor_focus(dir, speed)` |
 | Focus mode | `81 01 04 38 03 FF` | ACK only |
 | AE mode | `81 01 04 39 pp FF` | 00=auto, 03/0A/0B=manual → ISP exposure mode |
@@ -131,7 +134,37 @@ wb ct <kelvin>   — manual WB, specific colour temperature (2000–10000)
 display <0|1|2>  — debug overlay verbosity (0=off, 1=box, 2=box+score)
 osd on / osd off — toggle the score OSD (on implies box)
 facebox on/off   — toggle the green face box (off clears score too)
+eptz on / off    — enable/disable digital PTZ (off = full frame)
+eptz reset       — recenter, zoom = 1.0
+eptz zoom <f>    — absolute zoom factor (1.0 = full frame .. 8.0)
+eptz dzoom <f>   — relative zoom step
+eptz pan <f>     — relative crop-center move (+ = right)
+eptz tilt <f>    — relative crop-center move (+ = down)
+eptz center <cx> <cy> — absolute center, normalized 0..1
 ```
+
+### EPTZ — motorless digital pan/tilt/zoom (Patch 10)
+
+`RK_MPI_VI_SetEptz` crops a rectangle from the native 2592×1944 sensor frame and
+scales it to the output — shrink the rect to zoom in, move it to pan/tilt. It is
+a live operation (no channel teardown) and **off by default**. The VISCA zoom
+(`04 07`) and pan/tilt (`06 01`) handlers send EPTZ deltas over the IPC socket,
+so once enabled the KC2000 drives digital PTZ with **no motor hardware**.
+
+Lossless digital zoom depends on output resolution (crop ≥ output): up to ~4×
+at 640×480, ~2× at 1280×960, 1× at full 2592×1944. EPTZ state is normalized
+(center + zoom) so it survives resolution switches; it is re-applied after each
+in-place resize.
+
+Enable and test directly from the board (no controller needed):
+```sh
+S=/tmp/visca_isp.sock
+send(){ python3 -c "import socket,sys;s=socket.socket(socket.AF_UNIX,socket.SOCK_DGRAM);s.connect('$S');s.send(sys.argv[1].encode())" "$1"; }
+send "eptz on"; send "eptz zoom 2.0"; send "eptz pan 0.1"; send "eptz reset"; send "eptz off"
+```
+
+> Untested on hardware as of this commit — verify the crop+scale renders with
+> VPSS disabled (Patch 6) at the native 2592 config before relying on it.
 
 These IPC commands can also be sent directly from the board for testing:
 ```sh

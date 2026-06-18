@@ -69,6 +69,23 @@ static void handle_pan_tilt(int sock, struct sockaddr *src, socklen_t srclen,
            dir_name(pd), pan_spd, dir_name(td), tilt_spd);
     motor_pan(pd, pan_spd);
     motor_tilt(td, tilt_spd);
+
+    /* EPTZ digital pan/tilt (Phase 0). No-op until "eptz on" in rk_mpi_uvc.
+     * Each packet nudges the crop center; the KC2000 streams packets while
+     * the stick is held, so motion is continuous. +cx=right, +cy=down. */
+    if (pd != MOTOR_STOP) {
+        float step = 0.012f + (pan_spd / 24.0f) * 0.040f;
+        char c[40];
+        snprintf(c, sizeof(c), "eptz pan %.4f", pd == MOTOR_FWD ? step : -step);
+        isp_ctrl_send(c);
+    }
+    if (td != MOTOR_STOP) {
+        float step = 0.012f + (tilt_spd / 20.0f) * 0.040f;
+        /* td FWD = up = move crop up = decrease cy */
+        char c[40];
+        snprintf(c, sizeof(c), "eptz tilt %.4f", td == MOTOR_FWD ? -step : step);
+        isp_ctrl_send(c);
+    }
     reply(sock, src, srclen);
 }
 
@@ -82,6 +99,16 @@ static void handle_zoom(int sock, struct sockaddr *src, socklen_t srclen,
     int speed = pp & 0x0F;
     printf("[zoom]     dir=%s spd=%d (raw=0x%02x)\n", dir_name(dir), speed, pp);
     motor_zoom(dir, speed);
+
+    /* Hybrid zoom (Phase 0): no optical zoom motor yet, so the whole range is
+     * EPTZ. tele/in (FWD) = zoom in (+), wide/out (REV) = zoom out (-).
+     * No-op until "eptz on" in rk_mpi_uvc. */
+    if (dir != MOTOR_STOP) {
+        float step = 0.05f + (speed / 7.0f) * 0.10f;
+        char c[40];
+        snprintf(c, sizeof(c), "eptz dzoom %.4f", dir == MOTOR_FWD ? step : -step);
+        isp_ctrl_send(c);
+    }
     reply(sock, src, srclen);
 }
 

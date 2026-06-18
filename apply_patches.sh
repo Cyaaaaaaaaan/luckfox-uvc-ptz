@@ -1078,6 +1078,83 @@ fi
 
 ok "Patch 9 complete: hardware ISP sharpness"
 
+# ═════════════════════════════════════════════════════════════════════════════
+# PATCH 10 — EPTZ (digital pan/tilt/zoom via RK_MPI_VI_SetEptz)
+#   10a. Copy eptz.cpp/.h (always overwritten)
+#   10b. Add uvc/eptz.cpp to CMakeLists.txt
+#   10c. Wire eptz_init() into main.c
+#   10d. Re-apply EPTZ after the in-place resolution switch (uvc_mpi_vi.cpp)
+# (isp_ipc.cpp EPTZ commands ride along via Patch 8's always-copy.)
+# ═════════════════════════════════════════════════════════════════════════════
+MAIN10="$UVC_SRC/main.c"
+VI10="$UVC_SRC/uvc/uvc_mpi_vi.cpp"
+CMAKE10="$UVC_SRC/CMakeLists.txt"
+
+info "Patch 10: EPTZ digital pan/tilt/zoom"
+
+# 10a. always-overwrite eptz source so changes propagate
+cp "$FILES_UVC/eptz.cpp" "$UVC_SRC/uvc/eptz.cpp"
+cp "$FILES_UVC/eptz.h"   "$UVC_SRC/uvc/eptz.h"
+ok "  10a: eptz.cpp/h copied (always updated)"
+
+# 10b. CMakeLists.txt
+if grep -q "uvc/eptz.cpp" "$CMAKE10"; then
+    skip "  10b: eptz.cpp already in CMakeLists.txt"
+else
+    replace_in_file "$CMAKE10" \
+'    uvc/isp_ipc.cpp' \
+'    uvc/isp_ipc.cpp
+    uvc/eptz.cpp' \
+    && ok "  10b: eptz.cpp added to CMakeLists.txt" \
+    || error "  10b: could not add eptz.cpp to CMakeLists.txt"
+fi
+
+# 10c. main.c — include + init after focus_score_start
+if grep -q '#include "eptz.h"' "$MAIN10"; then
+    skip "  10c: eptz.h already included in main.c"
+else
+    replace_in_file "$MAIN10" \
+'#include "focus_score.h"' \
+'#include "focus_score.h"
+#include "eptz.h"' \
+    && ok "  10c: eptz.h included in main.c" \
+    || error "  10c: could not include eptz.h in main.c"
+fi
+if grep -q "eptz_init(" "$MAIN10"; then
+    skip "  10c: eptz_init already wired in main.c"
+else
+    replace_in_file "$MAIN10" \
+'  focus_score_start(0, 0); /* pipe=0, chn=0 — matches VI UVC channel default */' \
+'  focus_score_start(0, 0); /* pipe=0, chn=0 — matches VI UVC channel default */
+  eptz_init(0, 0, 2592, 1944); /* digital PTZ, off by default; crop from sensor native */' \
+    && ok "  10c: eptz_init() wired in main.c" \
+    || error "  10c: could not wire eptz_init() in main.c"
+fi
+
+# 10d. uvc_mpi_vi.cpp — include + re-apply after in-place resize
+if grep -q '#include "eptz.h"' "$VI10"; then
+    skip "  10d: eptz.h already included in uvc_mpi_vi.cpp"
+else
+    replace_in_file "$VI10" \
+'#include "uvc_video.h"' \
+'#include "uvc_video.h"
+#include "eptz.h"' \
+    && ok "  10d: eptz.h included in uvc_mpi_vi.cpp" \
+    || error "  10d: could not include eptz.h in uvc_mpi_vi.cpp"
+fi
+if grep -q "eptz_reapply()" "$VI10"; then
+    skip "  10d: eptz_reapply already wired in uvc_mpi_vi.cpp"
+else
+    replace_in_file "$VI10" \
+'      s_vi_was_resized[chnType] = 1;' \
+'      s_vi_was_resized[chnType] = 1;
+      eptz_reapply(); /* in-place SetChnAttr resets the crop — re-push EPTZ */' \
+    && ok "  10d: eptz_reapply() wired in uvc_mpi_vi.cpp" \
+    || error "  10d: could not wire eptz_reapply() in uvc_mpi_vi.cpp"
+fi
+
+ok "Patch 10 complete: EPTZ digital PTZ"
+
 echo ""
 ok "══════════════════════════════════════════"
 ok " All patches applied successfully!"
