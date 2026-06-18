@@ -189,6 +189,33 @@ motor_focus(dir,speed):drv8833_pwm(FOCUS,dir, map(speed))       # manual focus o
 ```
 Tilt must clamp at the ±45° software limits derived from homing; pan is continuous (no limit) unless a slip-ring/cable constraint applies.
 
+### 6e. Hybrid zoom controller (optical + EPTZ as one axis)
+
+The KC2000 sends one continuous zoom stream (`04 07`: `2x`=in, `3x`=out, `00`=stop) with no notion of optical vs digital. `visca_server` owns a **unified controller** that layers them: **optical first (lossless), EPTZ only extends past optical max**, and on zoom-out **EPTZ retracts before optical** — so optical is always preferred and digital is the outermost (lossy) layer. Handoff point is detected from the **zoom encoder** (AS5600L): optical is "maxed" when the zoom encoder reaches its homed max.
+
+```
+# state: zoom_motor_pos (encoder), eptz_zoom (1.0 = full frame, >1 = digital in)
+on VISCA zoom IN (speed s):
+    if zoom_motor_pos < ZOOM_MAX:           # optical headroom left
+        motor_zoom(IN, s)                    # drive lens zoom ring toward tele
+        # focus drifts on a varifocal — let AF track, or run focus-tracking table
+    else:                                    # optical exhausted → go digital
+        eptz_zoom = min(eptz_zoom + k*s, EPTZ_MAX)
+        apply_eptz(center, eptz_zoom)        # send "eptz"/"zoom" over /tmp/visca_isp.sock
+
+on VISCA zoom OUT (speed s):
+    if eptz_zoom > 1.0:                      # retract digital FIRST
+        eptz_zoom = max(eptz_zoom - k*s, 1.0)
+        apply_eptz(center, eptz_zoom)
+    else:
+        motor_zoom(OUT, s)                   # then back the lens off toward wide
+
+on VISCA zoom STOP: motor_zoom(STOP); (eptz holds)
+```
+- **Total magnification = optical × digital** (multiplicative). With the 5–50 mm lens that's 10× optical, extended by EPTZ (≈2× lossless at 1280×960, more but soft beyond — see §9.3 table).
+- **EPTZ doesn't disturb focus** (pure crop); only the *optical* stage shifts focus on the varifocal lens, so focus-tracking/AF only needs to run during the optical stage.
+- Lives entirely in `visca_server` (owns both `motor_zoom()` and the EPTZ IPC). Degrades gracefully: with no zoom motor yet (Phase 0), `ZOOM_MAX=0` so the whole range is EPTZ — i.e. the same controller gives pure digital zoom today and seamlessly gains the optical stage once the motor exists.
+
 ---
 
 ## 7. Open questions / decisions pending
