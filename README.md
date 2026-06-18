@@ -104,12 +104,19 @@ The score is always written to `/tmp/focus_score` regardless of display mode (`w
 | Focus near/far | `81 01 04 08 pp FF` | `motor_focus(dir, speed)` |
 | Focus mode | `81 01 04 38 03 FF` | ACK only |
 | AE mode | `81 01 04 39 pp FF` | 00=auto, 03/0A/0B=manual → ISP exposure mode |
-| WB mode | `81 01 04 35 pp FF` | 00=auto, 01=indoor(3200K), 02=outdoor(5800K), 05=manual → ISP WB |
-| CAM menu button | `81 01 06 06 pp FF` | cycles debug display mode 0→1→2→0 (sends `display N` over IPC) |
+| WB mode | `81 01 04 35 pp FF` | 00=auto, 01=indoor(3200K), 02=outdoor(5800K), 05=manual, 06=fluorescent, 07=incandescent, 08=warm, 09=natural, 0A=lock |
+| Sharpness | `81 01 04 A2 pp FF` | 02=up, 03=down, 00=reset → ISP sharpness [0-100] |
+| Sharpness direct | `81 01 04 42 0p 0q 0r 0s FF` | direct 4-bit value → ISP sharpness |
+| Picture effect | `81 01 04 3D pp FF` | 00=color (day), 04=B&W (night) → ISP color mode + IRCut GPIO |
+| Backlight comp. | `81 01 04 33 pp FF` | 02=BLC on, 03=BLC off |
+| Mirror (LR flip) | `81 01 04 61 pp FF` | 02=mirror on, 03=mirror off → hardware ISP flip |
+| Anti-flicker | `81 01 04 23 pp FF` | 00=off→50Hz, 01=50Hz, 02=60Hz |
+| Noise reduction | `81 01 04 53 pp FF` | 00=off, 01-05=NR levels → mixnr + spatial/temporal |
+| CAM menu button | `81 01 06 06 pp FF` | cycles debug display mode 0→1→2→0 |
 | Memory recall | `81 01 04 3F 02 pp FF` | ACK only |
 
 Responses: `90 41 FF` (ACK) + `90 51 FF` (completion) per command.
-Inquiries (`81 09 ...`): shadow state is maintained for AE/WB mode and returned as `90 50 [data] FF`.
+Inquiries (`81 09 ...`): shadow state maintained for AE/WB/sharpness/picture-effect/backlight/mirror/flicker/NR.
 
 The motor layer (`visca/motor.c`) is currently stubbed — it prints commands to stdout. Replace the function bodies with real TMC2209 UART and DRV8833 PWM calls when hardware is connected.
 
@@ -124,23 +131,52 @@ KC2000 ──UDP:1259──▶ visca_server ──Unix DGRAM──▶ rk_mpi_uvc
 
 Text command protocol (one per datagram):
 ```
-ae auto          — full auto exposure
-ae manual        — manual exposure
-wb auto          — auto white balance
-wb indoor        — manual WB, 3200 K
-wb outdoor       — manual WB, 5800 K
-wb manual        — manual WB (current CT unchanged)
-wb ct <kelvin>   — manual WB, specific colour temperature (2000–10000)
-display <0|1|2>  — debug overlay verbosity (0=off, 1=box, 2=box+score)
-osd on / osd off — toggle the score OSD (on implies box)
-facebox on/off   — toggle the green face box (off clears score too)
-eptz on / off    — enable/disable digital PTZ (off = full frame)
-eptz reset       — recenter, zoom = 1.0
-eptz zoom <f>    — absolute zoom factor (1.0 = full frame .. 8.0)
-eptz dzoom <f>   — relative zoom step
-eptz pan <f>     — relative crop-center move (+ = right)
-eptz tilt <f>    — relative crop-center move (+ = down)
-eptz center <cx> <cy> — absolute center, normalized 0..1
+# Exposure / White balance
+ae auto | manual               — ISP AE mode
+wb auto | indoor | outdoor | manual | fluorescent | incandescent | warm | natural | lock
+wb ct <kelvin>                 — manual WB, 2000–10000 K
+
+# Picture quality
+contrast <0-255>               — ISP contrast
+brightness <0-255>             — ISP brightness
+saturation <0-255>             — ISP saturation
+hue <0-255>                    — ISP hue
+sharpness <0-100>              — ISP sharpness (hardware)
+
+# Noise reduction
+nr mode close|2dnr|3dnr|mixnr  — NR algorithm
+nr spatial <0-100>             — spatial NR strength
+nr temporal <0-100>            — temporal NR strength
+
+# Anti-flicker
+flicker 50hz | 60hz            — power line frequency
+
+# Backlight / Highlight compensation
+blc on | off                   — backlight compensation
+blc level <1-100>              — BLC strength
+hlc on | off                   — highlight compensation
+hlc level <1-100>              — HLC level
+
+# Image geometry
+flip close|mirror|flip|centrosymmetric — hardware ISP mirror/flip (zero CPU)
+
+# Day/Night mode
+daynight day                   — color mode + insert IR-cut filter (GPIO 36)
+daynight night                 — B&W mode + remove IR-cut filter (GPIO 35)
+
+# Debug overlays
+display <0|1|2>                — verbosity (0=off, 1=box, 2=box+score)
+osd on | off
+facebox on | off
+
+# Digital PTZ
+eptz on | off                  — enable/disable digital PTZ
+eptz reset                     — recenter, zoom = 1.0
+eptz zoom <f>                  — absolute zoom (1.0 = full frame .. 8.0)
+eptz dzoom <f>                 — relative zoom step
+eptz pan <f>                   — relative crop-center move (+ = right)
+eptz tilt <f>                  — relative crop-center move (+ = down)
+eptz center <cx> <cy>          — absolute center, normalized 0..1
 ```
 
 ### EPTZ — motorless digital pan/tilt/zoom (Patch 10)
