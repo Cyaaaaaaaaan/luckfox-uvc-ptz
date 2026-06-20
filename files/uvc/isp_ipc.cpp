@@ -138,11 +138,25 @@ static void apply_cmd(const char *cmd) {
         if (sscanf(cmd + 12, "%f %f", &cx, &cy) == 2)
             eptz_set_center(cx, cy);
 
-    /* ── Face auto-tracking ──────────────────────────────────────────── */
+    /* ── Subject auto-tracking ───────────────────────────────────────── */
     } else if (strcmp(cmd, "autotrack on") == 0) {
         focus_score_set_autotrack(1);
     } else if (strcmp(cmd, "autotrack off") == 0) {
         focus_score_set_autotrack(0);
+
+    /* ── One-shot commenter lock (RockIVA person track ID) ───────────── */
+    } else if (strcmp(cmd, "track lock") == 0) {
+        focus_score_lock_target();
+    } else if (strcmp(cmd, "track unlock") == 0) {
+        focus_score_unlock_target();
+
+    /* ── VENC motion deblur (sharpens fast signing hands) ────────────── */
+    } else if (strcmp(cmd, "deblur on") == 0) {
+        focus_score_set_deblur(1);
+    } else if (strcmp(cmd, "deblur off") == 0) {
+        focus_score_set_deblur(0);
+    } else if (strncmp(cmd, "deblur strength ", 16) == 0) {
+        focus_score_set_deblur_strength(atoi(cmd + 16));
 
     /* ── OSD Camera menu ─────────────────────────────────────────────── */
     } else if (strcmp(cmd, "menu open") == 0) {

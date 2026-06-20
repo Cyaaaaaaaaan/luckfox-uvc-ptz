@@ -37,7 +37,10 @@ static void apply_locked(void)
     if (!s_enabled) {
         /* full frame — no crop */
         crop.bEnable = RK_FALSE;
-        RK_MPI_VI_SetEptz(s_pipe, s_chn, crop);
+        RK_S32 rc0 = RK_MPI_VI_SetEptz(s_pipe, s_chn, crop);
+        FILE *f0 = fopen("/tmp/eptz_dbg", "w");
+        if (f0) { fprintf(f0, "DISABLED pipe=%d chn=%d bEnable=0 rc=%d\n",
+                          s_pipe, s_chn, rc0); fclose(f0); }
         return;
     }
 
@@ -70,6 +73,15 @@ static void apply_locked(void)
     LOG_INFO("[eptz] zoom=%.2f c=(%.2f,%.2f) rect=%d,%d %dx%d (src %dx%d) rc=%d\n",
              (double)zoom, (double)s_cx, (double)s_cy, x, y, w, h,
              s_src_w, s_src_h, rc);
+
+    FILE *f = fopen("/tmp/eptz_dbg", "w");
+    if (f) {
+        fprintf(f, "ENABLED pipe=%d chn=%d zoom=%.2f c=(%.2f,%.2f) "
+                   "rect=%d,%d %dx%d src=%dx%d rc=%d\n",
+                s_pipe, s_chn, (double)zoom, (double)s_cx, (double)s_cy,
+                x, y, w, h, s_src_w, s_src_h, rc);
+        fclose(f);
+    }
 }
 
 void eptz_init(int vi_pipe, int vi_chn, int src_w, int src_h)

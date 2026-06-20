@@ -15,8 +15,13 @@
 #if FOCUS_SCORE_FACE_DETECT
 #include "rknn_api.h"
 #include "rknn_box_priors.h"
-#include <math.h>
 #include <climits>
+#endif
+#if FOCUS_SCORE_PERSON_DETECT
+#include "person_det.h"
+#endif
+#if FOCUS_SCORE_TARGET_DETECT
+#include <math.h>   /* fabsf in the auto-tracking P-controller */
 #endif
 #include <pthread.h>
 #include <stdio.h>
@@ -28,7 +33,10 @@
 #define FOCUS_SCORE_PATH  "/tmp/focus_score"
 #define SCORE_CROP_W      320
 #define SCORE_CROP_H      240
-#define SCORE_INTERVAL_US 500000
+/* Detection + focus-score + auto-track cadence. Lower = snappier tracking but
+ * more NPU/CPU load. Actual rate is (this sleep + inference time), so the NPU
+ * inference time is the real floor. 100 ms ≈ up to 10 Hz. */
+#define SCORE_INTERVAL_US 100000
 #define GETFRAME_TIMEOUT  200
 
 static pthread_t       s_tid;
@@ -264,6 +272,96 @@ static void face_box_draw(int x0_10k, int y0_10k, int x1_10k, int y1_10k)
     }
 }
 
+#if FOCUS_SCORE_VENC_ROI
+/* Bias the encoder toward the signer: set VENC ROI 0 to the upper ~60% of the
+ * person box (head/torso/hands — where signing happens), or disable when no
+ * target.  Relative QP −8 → more bits there at the same total bitrate, so the
+ * signing stays sharp when the background gets crushed on a Zoom call.
+ * Independent of the debug facebox visibility.  Rect aligned to 16 (macroblock). */
+#define ROI_INDEX       0
+#define ROI_QP_OFFSET   (-8)
+
+static void venc_roi_set_person(int x0_10k, int y0_10k, int x1_10k, int y1_10k, int valid)
+{
+    if (!s_face_box_ready) return;   /* VENC handle/size not known yet */
+
+    VENC_ROI_ATTR_S roi;
+    memset(&roi, 0, sizeof(roi));
+    roi.u32Index = ROI_INDEX;
+    roi.bAbsQp   = RK_FALSE;
+
+    int show = valid && (x0_10k < x1_10k) && (y0_10k < y1_10k);
+    if (show) {
+        /* upper ~60% of the body = head/torso/hands */
+        int y1_roi = y0_10k + (y1_10k - y0_10k) * 6 / 10;
+
+        int px = x0_10k * s_fbw / 10000;
+        int py = y0_10k * s_fbh / 10000;
+        int pw = (x1_10k - x0_10k) * s_fbw / 10000;
+        int ph = (y1_roi  - y0_10k) * s_fbh / 10000;
+
+        if (px < 0) px = 0;
+        if (py < 0) py = 0;
+        px &= ~15; py &= ~15;
+        pw = (pw + 15) & ~15;
+        ph = (ph + 15) & ~15;
+        if (px + pw > s_fbw) pw = (s_fbw - px) & ~15;
+        if (py + ph > s_fbh) ph = (s_fbh - py) & ~15;
+        show = (pw >= 16 && ph >= 16);
+
+        if (show) {
+            roi.bEnable          = RK_TRUE;
+            roi.s32Qp            = ROI_QP_OFFSET;
+            roi.stRect.s32X      = px;
+            roi.stRect.s32Y      = py;
+            roi.stRect.u32Width  = (RK_U32)pw;
+            roi.stRect.u32Height = (RK_U32)ph;
+        }
+    }
+    if (!show) roi.bEnable = RK_FALSE;
+
+    RK_S32 rc = RK_MPI_VENC_SetRoiAttr(s_fb_vchn, &roi);
+
+    static int s_last_en = -1;
+    if ((int)roi.bEnable != s_last_en) {        /* log only on enable/disable change */
+        s_last_en = (int)roi.bEnable;
+        FILE *f = fopen("/tmp/venc_roi", "w");
+        if (f) {
+            fprintf(f, "en=%d qp=%d rect=%d,%d %dx%d chn=%d rc=%d\n",
+                    roi.bEnable, roi.s32Qp, roi.stRect.s32X, roi.stRect.s32Y,
+                    roi.stRect.u32Width, roi.stRect.u32Height, s_fb_vchn, rc);
+            fclose(f);
+        }
+    }
+}
+#endif /* FOCUS_SCORE_VENC_ROI */
+
+#if FOCUS_SCORE_MOTION_DEBLUR
+/* VENC hardware motion deblur — sharpens fast motion (signing hands) on the
+ * encoded stream.  Applied to the streaming VENC channel; default ON.  Strength
+ * is only pushed if explicitly set via IPC (driver default otherwise). */
+static int          s_deblur_vchn = -1;
+static volatile int s_deblur_on   = 1;    /* default ON */
+static volatile int s_deblur_str  = -1;   /* -1 = leave at driver default */
+
+static void deblur_apply(void)
+{
+    if (s_deblur_vchn < 0) return;
+    RK_S32 rc  = RK_MPI_VENC_EnableMotionDeblur(s_deblur_vchn,
+                                                s_deblur_on ? RK_TRUE : RK_FALSE);
+    RK_S32 rcs = 0;
+    if (s_deblur_on && s_deblur_str >= 0)
+        rcs = RK_MPI_VENC_SetMotionDeblurStrength(s_deblur_vchn, (RK_U32)s_deblur_str);
+
+    FILE *f = fopen("/tmp/venc_deblur", "w");
+    if (f) {
+        fprintf(f, "on=%d strength=%d chn=%d rc=%d rcs=%d\n",
+                s_deblur_on, s_deblur_str, s_deblur_vchn, rc, rcs);
+        fclose(f);
+    }
+}
+#endif /* FOCUS_SCORE_MOTION_DEBLUR */
+
 /* Public: called from uvc_process startProcess() after startVenc() */
 void focus_score_osd_attach(int venc_dev, int venc_chn)
 {
@@ -307,13 +405,13 @@ void focus_score_osd_attach(int venc_dev, int venc_chn)
                  venc_dev, venc_chn);
     }
 
-#if FOCUS_SCORE_FACE_DETECT
-    /* ── face box: 4 thin OVERLAY_RGN strips, created/destroyed per detection ── */
+#if FOCUS_SCORE_TARGET_DETECT
+    /* ── subject box: 4 thin OVERLAY_RGN strips, created/destroyed per detection ── */
     {
         VENC_CHN_ATTR_S venc_attr;
         memset(&venc_attr, 0, sizeof(venc_attr));
         if (RK_MPI_VENC_GetChnAttr(venc_chn, &venc_attr) != RK_SUCCESS) {
-            LOG_WARN("focus_score: cannot query VENC size — face box disabled\n");
+            LOG_WARN("focus_score: cannot query VENC size — subject box disabled\n");
             return;
         }
         s_fbw     = (int)venc_attr.stVencAttr.u32PicWidth;
@@ -321,9 +419,16 @@ void focus_score_osd_attach(int venc_dev, int venc_chn)
         s_fb_vdev = venc_dev;
         s_fb_vchn = venc_chn;
         s_face_box_ready = 1;
-        LOG_INFO("focus_score: face box OVERLAY strips ready %dx%d\n", s_fbw, s_fbh);
+        LOG_INFO("focus_score: subject box OVERLAY strips ready %dx%d\n", s_fbw, s_fbh);
     }
-#endif /* FOCUS_SCORE_FACE_DETECT */
+#endif /* FOCUS_SCORE_TARGET_DETECT */
+
+#if FOCUS_SCORE_MOTION_DEBLUR
+    /* Enable hardware motion deblur on the streaming channel (default ON).
+     * Re-runs on every stream/resolution (re)start since this attach does. */
+    s_deblur_vchn = venc_chn;
+    deblur_apply();
+#endif
 
     menu_osd_attach(venc_dev, venc_chn);
 }
@@ -333,8 +438,11 @@ void focus_score_osd_detach(int venc_dev, int venc_chn)
 {
     MPP_CHN_S chn = { RK_ID_VENC, venc_dev, venc_chn };
 
-#if FOCUS_SCORE_FACE_DETECT
+#if FOCUS_SCORE_TARGET_DETECT
     if (s_face_box_ready) {
+#if FOCUS_SCORE_VENC_ROI
+        venc_roi_set_person(0, 0, 0, 0, 0);   /* clear encoder ROI before teardown */
+#endif
         s_face_box_ready = 0;
         /* Strips may or may not exist depending on last detection — always try */
         for (int i = 0; i < 4; i++) {
@@ -393,9 +501,28 @@ int focus_score_get_display_mode(void)
 }
 
 /* ==========================================================================
- * Face detection via RKNN (RetinaFace) — compiled out when FOCUS_SCORE_FACE_DETECT == 0
- * Uses librknnmrt directly instead of RockIVA to avoid model version issues.
+ * Subject detection — drives the AF window, focus-score crop, OSD target box
+ * and the auto-tracking P-controller.  Two interchangeable NPU back ends:
+ *   FOCUS_SCORE_PERSON_DETECT — RockIVA full-body person detect + track IDs
+ *   FOCUS_SCORE_FACE_DETECT   — hand-rolled RetinaFace via librknnmrt
+ * (mutually exclusive — both use the single NPU core).
  * ========================================================================== */
+#if FOCUS_SCORE_TARGET_DETECT
+
+/* Selected subject bbox in 10000-scale coords — updated each detection run.
+ * Named s_face_* for historical reasons; under PERSON_DETECT it is a person box. */
+static pthread_mutex_t  s_face_mutex  = PTHREAD_MUTEX_INITIALIZER;
+static int16_t          s_face_x0 = 0, s_face_y0 = 0;
+static int16_t          s_face_x1 = 0, s_face_y1 = 0;
+static int              s_face_valid  = 0;
+static volatile int     s_autotrack   = 0; /* P-controller → EPTZ auto-tracking */
+
+/* Set rkaiq AF measurement window to subject bbox (pixels), or full frame. */
+static void af_set_window(int frame_w, int frame_h,
+                          int fx0, int fy0, int fx1, int fy1, int valid);
+
+#endif /* FOCUS_SCORE_TARGET_DETECT */
+
 #if FOCUS_SCORE_FACE_DETECT
 
 #define MODEL_PATH      "/oem/usr/share/models/retinaface.rknn"
@@ -415,13 +542,6 @@ static float            s_out_sc[3]   = {0.f, 0.f, 0.f};
 static uint8_t         *s_det_buf     = NULL;
 static size_t           s_det_buf_sz  = 0;
 static int              s_det_tick    = 0;
-
-/* Face bounding box in 10000-scale coords — updated each inference run */
-static pthread_mutex_t  s_face_mutex  = PTHREAD_MUTEX_INITIALIZER;
-static int16_t          s_face_x0 = 0, s_face_y0 = 0;
-static int16_t          s_face_x1 = 0, s_face_y1 = 0;
-static int              s_face_valid  = 0;
-static volatile int     s_autotrack   = 0; /* P-controller → EPTZ auto-tracking */
 
 static void face_det_init(void)
 {
@@ -508,9 +628,6 @@ static void downsample_nv12(uint8_t *dst, const uint8_t *src,
 
 /* Synchronous RetinaFace inference on one VI frame.
  * Pipeline: downsample → letterbox NV12→BGR 640×640 → rknn_run → parse. */
-static void af_set_window(int frame_w, int frame_h,
-                          int fx0, int fy0, int fx1, int fy1, int valid);
-
 static void face_det_run(const uint8_t *nv12, int w, int h, int stride)
 {
     if (!s_rknn_ctx || !s_input_mem) return;
@@ -648,8 +765,12 @@ static void face_det_run(const uint8_t *nv12, int w, int h, int stride)
 #endif
 }
 
-/* Set rkaiq AF measurement window to face bbox (pixels), or full frame.
- * Called after every face detection run so the ISP scores the right region. */
+#endif /* FOCUS_SCORE_FACE_DETECT — RetinaFace inference */
+
+#if FOCUS_SCORE_TARGET_DETECT
+
+/* Set rkaiq AF measurement window to subject bbox (pixels), or full frame.
+ * Called after every detection run so the ISP scores the right region. */
 static void af_set_window(int frame_w, int frame_h,
                           int fx0, int fy0, int fx1, int fy1, int valid)
 {
@@ -715,7 +836,7 @@ static void get_crop(int w, int h, int *cx, int *cy, int *cw, int *ch)
     }
 }
 
-#else  /* !FOCUS_SCORE_FACE_DETECT — use static center crop */
+#else  /* !FOCUS_SCORE_TARGET_DETECT — use static center crop */
 
 static void get_crop(int w, int h, int *cx, int *cy, int *cw, int *ch)
 {
@@ -725,7 +846,7 @@ static void get_crop(int w, int h, int *cx, int *cy, int *cw, int *ch)
     *cy = (h - *ch) / 2;
 }
 
-#endif /* FOCUS_SCORE_FACE_DETECT */
+#endif /* FOCUS_SCORE_TARGET_DETECT */
 
 /* ==========================================================================
  * Focus scoring thread
@@ -762,13 +883,57 @@ static void *focus_thread(void *arg)
         int stride = (int)frame.stVFrame.u32VirWidth;
         if (stride <= 0) stride = w;
 
+        /* EPTZ crops in the VI channel's OUTPUT coordinate space (this frame's
+         * w×h), NOT the sensor native — keep its source size synced to the live
+         * frame so zoom/pan rects are valid and survive resolution switches.    */
+        static int s_eptz_src_w = 0, s_eptz_src_h = 0;
+        if (w > 0 && h > 0 && (w != s_eptz_src_w || h != s_eptz_src_h)) {
+            s_eptz_src_w = w; s_eptz_src_h = h;
+            eptz_set_source_size(w, h);
+        }
+
         if (w > 0 && h > 0 && frame.stVFrame.pMbBlk) {
             RK_MPI_SYS_MmzFlushCache(frame.stVFrame.pMbBlk, RK_TRUE);
             const uint8_t *y_plane =
                 (const uint8_t *)RK_MPI_MB_Handle2VirAddr(frame.stVFrame.pMbBlk);
 
             if (y_plane) {
-#if FOCUS_SCORE_FACE_DETECT
+#if FOCUS_SCORE_PERSON_DETECT
+                {
+                    int dma_fd = RK_MPI_MB_Handle2Fd(frame.stVFrame.pMbBlk);
+                    person_det_run_fd(dma_fd, w, h, frame_counter);
+
+                    person_target_t tgt;
+                    person_det_get_target(&tgt);
+
+                    pthread_mutex_lock(&s_face_mutex);
+                    s_face_x0 = tgt.x0; s_face_y0 = tgt.y0;
+                    s_face_x1 = tgt.x1; s_face_y1 = tgt.y1;
+                    s_face_valid = tgt.valid;
+                    pthread_mutex_unlock(&s_face_mutex);
+
+                    af_set_window(w, h, tgt.x0, tgt.y0, tgt.x1, tgt.y1, tgt.valid);
+#if FOCUS_SCORE_OSD
+                    face_box_draw(tgt.valid ? tgt.x0 : 0, tgt.valid ? tgt.y0 : 0,
+                                  tgt.valid ? tgt.x1 : 0, tgt.valid ? tgt.y1 : 0);
+#if FOCUS_SCORE_VENC_ROI
+                    /* Encoder ROI follows the actual target (not the debug box). */
+                    venc_roi_set_person(tgt.x0, tgt.y0, tgt.x1, tgt.y1, tgt.valid);
+#endif
+#endif
+                    /* ── Auto-tracking P-controller (holds the locked person) ── */
+                    if (s_autotrack && tgt.valid) {
+                        float fcx = (tgt.x0 + tgt.x1) * 0.5f / 10000.0f;
+                        float fcy = (tgt.y0 + tgt.y1) * 0.5f / 10000.0f;
+                        float ex  = fcx - 0.5f;
+                        float ey  = fcy - 0.5f;
+                        if (fabsf(ex) > 0.04f || fabsf(ey) > 0.04f) {
+                            eptz_pan(ex  * 0.35f);
+                            eptz_tilt(ey * 0.35f);
+                        }
+                    }
+                }
+#elif FOCUS_SCORE_FACE_DETECT
                 if (++s_det_tick >= FACE_DET_EVERY) {
                     s_det_tick = 0;
                     face_det_run(y_plane, w, h, stride);
@@ -831,6 +996,8 @@ static void *focus_thread(void *arg)
 
 #if FOCUS_SCORE_FACE_DETECT
     face_det_deinit();
+#elif FOCUS_SCORE_PERSON_DETECT
+    person_det_deinit();
 #endif
 
     remove(FOCUS_SCORE_PATH);
@@ -838,6 +1005,7 @@ static void *focus_thread(void *arg)
     return NULL;
 }
 
+#if FOCUS_SCORE_TARGET_DETECT
 void focus_score_set_autotrack(int on)
 {
     s_autotrack = on ? 1 : 0;
@@ -848,6 +1016,33 @@ int focus_score_get_autotrack(void)
 {
     return s_autotrack;
 }
+#else
+void focus_score_set_autotrack(int on) { (void)on; }
+int  focus_score_get_autotrack(void)   { return 0; }
+#endif
+
+/* One-shot commenter lock — only meaningful with RockIVA track IDs. */
+#if FOCUS_SCORE_PERSON_DETECT
+void focus_score_lock_target(void)      { person_det_lock_current(); }
+void focus_score_unlock_target(void)    { person_det_unlock(); }
+int  focus_score_target_is_locked(void) { return person_det_is_locked(); }
+#else
+void focus_score_lock_target(void)      {}
+void focus_score_unlock_target(void)    {}
+int  focus_score_target_is_locked(void) { return 0; }
+#endif
+
+/* VENC motion deblur (defined where the VENC handle/deblur state live). */
+#if FOCUS_SCORE_OSD && FOCUS_SCORE_MOTION_DEBLUR
+void focus_score_set_deblur(int on)         { s_deblur_on = on ? 1 : 0; deblur_apply(); }
+void focus_score_set_deblur_strength(int s) { if (s < 0) s = 0; if (s > 3) s = 3;
+                                              s_deblur_str = s; deblur_apply(); }
+int  focus_score_get_deblur(void)           { return s_deblur_on; }
+#else
+void focus_score_set_deblur(int on)         { (void)on; }
+void focus_score_set_deblur_strength(int s) { (void)s; }
+int  focus_score_get_deblur(void)           { return 0; }
+#endif
 
 void focus_score_start(int pipe_id, int chn_id)
 {

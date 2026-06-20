@@ -64,6 +64,8 @@ post_chk() {
     fi
 
     export PATH=/oem/usr/bin:/usr/bin:/bin:/usr/sbin:/sbin:$PATH
+    # librockiva.so lives in /oem until the next firmware reflash bakes it into /usr/lib
+    export LD_LIBRARY_PATH=/oem/usr/lib:$LD_LIBRARY_PATH
     export rt_log_level=3
     export rk_mpi_uvc_log_level=2
     touch /tmp/uvc_no_timeout

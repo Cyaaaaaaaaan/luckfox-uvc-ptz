@@ -58,6 +58,7 @@ Patches are applied by `apply_patches.sh` (idempotent — safe to re-run).
 | 9 | `focus_score.cpp` + `isp.h` | Replace CPU Tenengrad with hardware ISP sharpness stats via `rk_aiq_user_api2_af_GetSearchPath()` — zero CPU cost, updates every frame |
 | 10 | `eptz.cpp` + wiring | Digital pan/tilt/zoom via `RK_MPI_VI_SetEptz` (crop+scale of the sensor frame), driven by VISCA — motorless PTZ |
 | 11 | `menu_osd.cpp` + wiring | Full visual OSD camera menu — 14 settings, navigated from the KC2000 via menu button / tilt / zoom |
+| 12 | `person_det.cpp` + wiring | RockIVA full-body **person detection + persistent track IDs** on the NPU — replaces the RetinaFace path; enables one-shot "lock onto the commenter, then hold" |
 
 **Key VI fix:** `RK_MPI_VI_DisableChn` on RV1106 triggers a full ISP restart → AIQ detects SOF disorder (frame counter reset) → VI permanently stops delivering frames. These patches replace DisableChn with in-place `RK_MPI_VI_SetChnAttr`, requiring `stIspOpt.stMaxSize` to be set to the sensor native max (2592×1944).
 
@@ -179,9 +180,17 @@ eptz pan <f>                   — relative crop-center move (+ = right)
 eptz tilt <f>                  — relative crop-center move (+ = down)
 eptz center <cx> <cy>          — absolute center, normalized 0..1
 
-# Face auto-tracking
-autotrack on | off             — P-controller: nudges EPTZ center to keep face centered
+# Subject auto-tracking
+autotrack on | off             — P-controller: nudges EPTZ center to keep the subject centered
                                  (also enables EPTZ automatically when turned on)
+
+# Commenter lock (RockIVA person track ID — Patch 12)
+track lock                     — pin tracking to the currently selected person's track ID
+track unlock                   — resume automatic closest-to-centre selection
+
+# VENC motion deblur (sharpens fast signing hands) — default ON
+deblur on | off                — toggle hardware motion deblur on the stream
+deblur strength <0..3>         — optional strength (driver default if never set)
 ```
 
 ### EPTZ — motorless digital pan/tilt/zoom (Patch 10)
@@ -204,8 +213,15 @@ send(){ python3 -c "import socket,sys;s=socket.socket(socket.AF_UNIX,socket.SOCK
 send "eptz on"; send "eptz zoom 2.0"; send "eptz pan 0.1"; send "eptz reset"; send "eptz off"
 ```
 
-> EPTZ is untested on hardware as of this commit — verify the crop+scale renders with
-> VPSS disabled (Patch 6) at the native 2592 config before relying on it.
+> **EPTZ is a confirmed dead-end on this hardware — scrapped.** `RK_MPI_VI_SetEptz`
+> returns success but never renders live; the crop only commits on a channel
+> reinit (resolution switch), and a crop active during an in-place resize makes
+> the stream lag then crash until `eptz off`/reboot. Cause: EPTZ's scaler re-latch
+> collides with the in-place `SetChnAttr` resize mechanism (Patches 1–3) + VPSS
+> disabled (Patch 6). The code/commands remain but **stay off**. Actuation goes
+> mechanical (optical zoom + pan/tilt motors) driven by the person-detection track
+> data. Debug trace: `/tmp/eptz_dbg`. If digital zoom is ever wanted, use **VPSS**
+> (`RK_MPI_VPSS_SetChnCrop` + `SetChnRotation`), not VI EPTZ.
 
 ### Face auto-tracking (Phase 0.5)
 
@@ -229,6 +245,64 @@ send "autotrack on"   # EPTZ activates + face tracking starts
 send "autotrack off"  # tracking stops, EPTZ holds current position
 send "eptz reset"     # optionally recenter after disabling
 ```
+
+### RockIVA person detection + tracking (Patch 12)
+
+The RetinaFace path (Patch 7) detects faces; at the steep back-row angles of a
+meeting room a face is often too small or oblique to detect reliably. Patch 12
+swaps in the SDK's **RockIVA** library, which does full-body **person** detection
+with **persistent track IDs** on the NPU — far more robust for a standing
+commenter, and the track IDs are what make a clean "lock onto one person" possible.
+
+`person_det.cpp` wraps RockIVA:
+- `ROCKIVA_Init(VIDEO mode)` + `ROCKIVA_DETECT_Init` with the **PFP** model
+  (person/face/pet, `object_detection_pfp.data`).
+- Each scoring cycle the NV12 VI frame is pushed **by DMA fd** (`RK_MPI_MB_Handle2Fd`)
+  — no CPU colour-convert/letterbox like RetinaFace needed — then
+  `ROCKIVA_WaitFinish` blocks until that frame's result callback fires.
+- The callback selects one target (locked track ID if set, else closest-to-centre)
+  and publishes its bbox; `focus_score.cpp` feeds that to the same AF window,
+  focus crop, OSD box and auto-track P-controller the face path used.
+
+**Back-end switch** (`focus_score.h`, mutually exclusive — both use the one NPU core):
+```c
+#define FOCUS_SCORE_PERSON_DETECT 1   /* RockIVA person detect + track IDs (default) */
+#define FOCUS_SCORE_FACE_DETECT   0   /* legacy RetinaFace                            */
+```
+
+**One-shot commenter lock** — the meeting-appropriate behaviour (position once, hold):
+```sh
+send "autotrack on"   # person tracking + EPTZ active
+send "track lock"     # pin onto the standing commenter's track ID
+# ... camera holds that person even if others are more central ...
+send "track unlock"   # release; resume closest-to-centre
+```
+
+**Deploy** (in addition to the binary): the PFP model and `librockiva.so` are new
+runtime dependencies. The lib is baked into the rootfs overlay by `apply_patches.sh`
+(present after a firmware rebuild/reflash); the model is staged at
+`files/models/iva/object_detection_pfp.data` and must be copied to the board:
+```sh
+scp files/models/iva/object_detection_pfp.data root@$PICO_IP:/tmp/
+ssh root@$PICO_IP 'mount -o remount,rw /oem && mkdir -p /oem/usr/share/iva && \
+  cp /tmp/object_detection_pfp.data /oem/usr/share/iva/'
+# librockiva.so → /usr/lib (if not yet reflashed): scp + cp under remount,rw
+```
+
+> Prototype — built and link-verified (`rk_mpi_uvc` declares `librockiva.so` /
+> `librknnmrt.so` as deps). Not yet run on hardware: verify the PFP model loads
+> from `/oem/usr/share/iva`, that push-by-fd at 2592×1944 detects persons, and
+> tune `PERSON_DET_SCORE` / detection cadence. Debug: `cat /tmp/person_det`.
+
+### Person-ROI — encoder bit-biasing for the signer (`FOCUS_SCORE_VENC_ROI`)
+
+Each detection cycle, `focus_score` hands the H.264/H.265 encoder a **VENC ROI**
+(`RK_MPI_VENC_SetRoiAttr`) on the upper ~60% of the person box — the head/torso/
+hands where signing happens — with relative QP −8. The encoder then spends **more
+bits there at the same total bitrate**, so the signing stays sharp even when
+bandwidth crushes the background on a Zoom call. It follows the detected/locked
+person, disables when there's no target, and is independent of the debug box.
+Pipeline-independent (none of the EPTZ issues). Debug: `cat /tmp/venc_roi`.
 
 ### OSD Camera menu (Patch 11)
 

@@ -1185,6 +1185,103 @@ fi
 
 ok "Patch 11 complete: OSD camera menu"
 
+# ═════════════════════════════════════════════════════════════════════════════
+# PATCH 12 — RockIVA person detection + tracking (replaces RetinaFace path)
+#
+#   Adds person_det.cpp/.h: a RockIVA wrapper that does full-body PERSON
+#   detection with persistent track IDs on the NPU.  focus_score.cpp selects it
+#   when FOCUS_SCORE_PERSON_DETECT == 1 (the default in focus_score.h), feeding
+#   the same AF window / focus crop / OSD box / auto-track consumers the
+#   RetinaFace path used.  Track IDs enable the one-shot "lock onto the
+#   commenter, then hold" behaviour (IPC: "track lock" / "track unlock").
+#
+#   Build deps:   librockiva.so (+ librknnmrt.so, already linked)
+#   Runtime model: object_detection_pfp.data → /oem/usr/share/iva/  (deploy step)
+# ═════════════════════════════════════════════════════════════════════════════
+PATCH12_DESC="Patch 12: RockIVA person detection + tracking (person_det.cpp)"
+CMAKE12="$UVC_SRC/CMakeLists.txt"
+ROCKIVA_RV1106="$SDK_DIR/media/iva/iva/librockiva/rockiva-rv1106-Linux"
+ROCKIVA_INC_SRC="$ROCKIVA_RV1106/include"
+ROCKIVA_LIB_SRC="$ROCKIVA_RV1106/lib/librockiva.so"
+ROCKIVA_MODEL_SRC="$SDK_DIR/media/iva/iva/models/rockiva_data_rv1106/object_detection_pfp.data"
+OVERLAY_LIB="$SDK_DIR/project/cfg/BoardConfig_IPC/overlay/overlay-luckfox-glibc-rockchip/usr/lib"
+
+info "$PATCH12_DESC"
+
+# 12a. person_det.cpp/.h — always overwritten so changes propagate
+cp "$FILES_UVC/person_det.cpp" "$UVC_SRC/uvc/person_det.cpp"
+cp "$FILES_UVC/person_det.h"   "$UVC_SRC/uvc/person_det.h"
+ok "  12a: person_det.cpp/h copied (always updated)"
+
+# 12b. RockIVA headers into uvc/rockiva/ (self-contained, resolved via -Iuvc)
+if [[ -d "$ROCKIVA_INC_SRC" ]]; then
+    mkdir -p "$UVC_SRC/uvc/rockiva"
+    cp "$ROCKIVA_INC_SRC"/rockiva_*.h "$UVC_SRC/uvc/rockiva/"
+    ok "  12b: RockIVA headers copied to uvc/rockiva/"
+else
+    error "  12b: RockIVA headers not found at $ROCKIVA_INC_SRC"
+fi
+
+# 12c. CMakeLists.txt — add person_det.cpp next to menu_osd.cpp
+if grep -q "uvc/person_det.cpp" "$CMAKE12"; then
+    skip "  12c: person_det.cpp already in CMakeLists.txt"
+else
+    replace_in_file "$CMAKE12" \
+'    uvc/menu_osd.cpp' \
+'    uvc/menu_osd.cpp
+    uvc/person_det.cpp' \
+    && ok "  12c: person_det.cpp added to CMakeLists.txt" \
+    || error "  12c: could not add person_det.cpp — check CMakeLists.txt manually"
+fi
+
+# 12d. CMakeLists.txt — link librockiva before rknnmrt (rockiva depends on it)
+if grep -q "rockiva" "$CMAKE12"; then
+    skip "  12d: rockiva already in CMakeLists.txt"
+else
+    # fastboot dep list (4-space indent, librockit.a present)
+    replace_in_file "$CMAKE12" \
+'    rkaiq
+    rknnmrt
+    librockit.a' \
+'    rkaiq
+    rockiva
+    rknnmrt
+    librockit.a' \
+    && ok "  12d: rockiva added to fastboot libs" \
+    || error "  12d: could not add rockiva to fastboot libs"
+
+    # non-fastboot dep list (8-space indent, rockit present)
+    replace_in_file "$CMAKE12" \
+'        rkaiq
+        rknnmrt
+        rockit' \
+'        rkaiq
+        rockiva
+        rknnmrt
+        rockit' \
+    && ok "  12d: rockiva added to non-fastboot libs" \
+    || error "  12d: could not add rockiva to non-fastboot libs"
+fi
+
+# 12e. Deploy librockiva.so into the rootfs overlay (runtime dependency)
+if [[ -f "$ROCKIVA_LIB_SRC" && -d "$OVERLAY_LIB" ]]; then
+    cp "$ROCKIVA_LIB_SRC" "$OVERLAY_LIB/librockiva.so"
+    ok "  12e: librockiva.so copied to rootfs overlay usr/lib"
+else
+    error "  12e: librockiva.so or overlay usr/lib missing (lib=$ROCKIVA_LIB_SRC)"
+fi
+
+# 12f. Stage the PFP model into the repo for deployment to /oem/usr/share/iva
+if [[ -f "$ROCKIVA_MODEL_SRC" ]]; then
+    mkdir -p "$REPO_DIR/files/models/iva"
+    cp "$ROCKIVA_MODEL_SRC" "$REPO_DIR/files/models/iva/object_detection_pfp.data"
+    ok "  12f: PFP model staged at files/models/iva/ (deploy to /oem/usr/share/iva)"
+else
+    error "  12f: PFP model not found at $ROCKIVA_MODEL_SRC"
+fi
+
+ok "Patch 12 complete: RockIVA person detection + tracking"
+
 echo ""
 ok "══════════════════════════════════════════"
 ok " All patches applied successfully!"
